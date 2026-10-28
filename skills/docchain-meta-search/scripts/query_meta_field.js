@@ -152,8 +152,7 @@ function parseArgs(argv, argSpec) {
         }
         const spec = argSpec[name];
         if (!spec) {
-            console.error(`❌ 错误：未知参数：${arg}`);
-            process.exit(1);
+            printError('CONFIG', `未知参数：${arg}`);
         }
         if (spec.flag) {
             args[name] = true;
@@ -163,14 +162,12 @@ function parseArgs(argv, argSpec) {
             value = argv[i + 1];
             i += 1;
             if (value === undefined) {
-                console.error(`❌ 错误：参数 ${arg} 缺少值`);
-                process.exit(1);
+                printError('CONFIG', `参数 ${arg} 缺少值`);
             }
         }
         if (spec.type === 'int') {
             if (!/^\d+$/.test(value)) {
-                console.error(`❌ 错误：参数 ${arg} 必须是数字`);
-                process.exit(1);
+                printError('CONFIG', `参数 ${arg} 必须是数字`);
             }
             value = parseInt(value, 10);
         }
@@ -178,12 +175,10 @@ function parseArgs(argv, argSpec) {
     }
     for (const [name, spec] of Object.entries(argSpec)) {
         if (spec.required && (args[name] === null || args[name] === undefined)) {
-            console.error(`❌ 错误：缺少必填参数 --${name}`);
-            process.exit(1);
+            printError('CONFIG', `缺少必填参数 --${name}`);
         }
         if (spec.choices && args[name] !== null && !spec.choices.includes(args[name])) {
-            console.error(`❌ 错误：参数 --${name} 取值必须是 ${spec.choices.join('/')}`);
-            process.exit(1);
+            printError('CONFIG', `参数 --${name} 取值必须是 ${spec.choices.join('/')}`);
         }
     }
     return args;
@@ -202,8 +197,7 @@ function parseIdList(value, label) {
         const trimmed = item.trim();
         if (!trimmed) continue;
         if (!/^\d+$/.test(trimmed)) {
-            console.error(`❌ 错误：${label} 必须是数字`);
-            process.exit(1);
+            printError('CONFIG', `${label} 必须是数字`);
         }
         ids.push(Number(trimmed));
     }
@@ -257,10 +251,40 @@ function getConfig() {
     }
 
     if (!config.docchain_url || !config.docchain_api_key) {
-        console.log(JSON.stringify({ error: '配置不完整', message: CONFIG_MESSAGE }));
-        process.exit(1);
+        printError('CONFIG', CONFIG_MESSAGE);
     }
     return config;
+}
+
+/**
+ * Print a structured failure envelope `{ok:false, error, message}` on stdout
+ * and exit. `NO_RESULTS` is treated as a normal empty result (exit 0); any
+ * other code exits 1.
+ * @param {string} error - CONFIG|NO_RESULTS|NOT_FOUND|NO_PERMISSION|SERVER_ERROR
+ * @param {string} message
+ */
+function printError(error, message) {
+    console.log(JSON.stringify({ ok: false, error, message }));
+    process.exit(error === 'NO_RESULTS' ? 0 : 1);
+}
+
+/**
+ * Print a failure as a structured envelope, then exit.
+ * HTTP errors map per status code; anything else is a network failure.
+ * @param {Error} error
+ * @param {object} [statusMessages] - HTTP status code to friendly message
+ */
+function failWith(error, statusMessages = {}) {
+    if (error instanceof HttpError) {
+        if (error.status === 401 || error.status === 403) {
+            printError('NO_PERMISSION', statusMessages[error.status] || '无权限访问文档或主题');
+        }
+        if (error.status >= 500) {
+            printError('SERVER_ERROR', '服务端错误（HTTP ' + error.status + '）');
+        }
+        printError('SERVER_ERROR', statusMessages[error.status] || `API 请求失败：HTTP ${error.status}`);
+    }
+    printError('SERVER_ERROR', `网络错误：${error.message}`);
 }
 
 /**
@@ -445,6 +469,37 @@ function formatResults(data, conditionsStr = '') {
     return lines.join('\n');
 }
 
+/**
+ * 构造机器可读摘要（成功时附在可读输出之后）。
+ * @param {object} data - API 响应数据
+ * @param {string} conditionsStr
+ * @returns {object}
+ */
+function buildQueryPayload(data, conditionsStr) {
+    const records = data.records || [];
+    return {
+        ok: true,
+        mode: 'query',
+        conditions: conditionsStr || '',
+        total: data.total || 0,
+        returned: records.length,
+        documents: records.map((record) => ({
+            doc_id: record.doc_id ?? null,
+            path: record.path ?? '',
+            topic_id: record.topic_id ?? null,
+            meta: (record.custom_meta_data || []).map((field) => ({
+                field_name: field.field_name,
+                field_type: field.field_type,
+                value: field.field_type === 'int'
+                    ? field.field_value_int
+                    : field.field_type === 'date'
+                        ? field.field_value_date
+                        : field.field_value_str,
+            })),
+        })),
+    };
+}
+
 async function main() {
     const args = parseArgs(process.argv.slice(2), ARG_SPEC);
 
@@ -459,23 +514,25 @@ async function main() {
     // --list_fields 模式：仅列出字段结构
     if (args.list_fields) {
         if (!topicIds) {
-            console.error('❌ 错误：--list_fields 需要指定主题 ID（--topic_ids）');
-            process.exit(1);
+            printError('CONFIG', '错误：--list_fields 需要指定主题 ID（--topic_ids）');
         }
 
         try {
+            const fieldsPayload = [];
             for (const topicId of topicIds) {
                 const result = await listTopicMetadataFields(topicId);
                 if (result && result.success) {
                     console.log(formatMetadataFields(result.data || [], topicId));
+                    fieldsPayload.push({ topic_id: topicId, fields: result.data || [] });
                 } else {
                     console.log(`❌ 主题 ${topicId} 查询失败：${(result && result.err) || '未知错误'}`);
+                    fieldsPayload.push({ topic_id: topicId, error: (result && result.err) || '未知错误' });
                 }
                 console.log(); // 主题之间空一行
             }
+            console.log(JSON.stringify({ ok: true, mode: 'fields', topics: fieldsPayload }));
         } catch (error) {
-            console.error(`❌ 错误：${error.message}`);
-            process.exit(1);
+            failWith(error);
         }
         return;
     }
@@ -492,9 +549,7 @@ async function main() {
             if (parsed) {
                 conditions.push(parsed);
             } else {
-                console.error(`❌ 错误：条件解析失败：${condStr}`);
-                console.error('格式应为：field_name,operation,value，例如：author,eq,张三');
-                process.exit(1);
+                printError('CONFIG', `条件解析失败：${condStr}；格式应为 field_name,operation,value，例如 author,eq,张三`);
             }
         }
     }
@@ -516,8 +571,7 @@ async function main() {
                     // 格式化条件显示：field_name operation value
                     groupDisplayParts.push(`${parsed.field_name} ${parsed.operation} ${parsed.value}`);
                 } else {
-                    console.error(`❌ 错误：OR组内条件解析失败：${condStr}`);
-                    process.exit(1);
+                    printError('CONFIG', `OR组内条件解析失败：${condStr}`);
                 }
             }
             if (groupConditions.length > 0) {
@@ -529,8 +583,7 @@ async function main() {
 
     // 检查 topic_ids 和 doc_ids
     if (!topicIds && !docIds) {
-        console.error('❌ 错误：必须提供 --topic_ids 或 --doc_ids 之一');
-        process.exit(1);
+        printError('CONFIG', '错误：必须提供 --topic_ids 或 --doc_ids 之一');
     }
 
     // 构建条件描述
@@ -552,13 +605,12 @@ async function main() {
         if (results && results.success) {
             const data = results.data || {};
             console.log(formatResults(data, fullConditionsStr));
+            console.log(JSON.stringify(buildQueryPayload(data, fullConditionsStr)));
         } else {
-            console.error(`❌ 查询失败：${(results && results.err) || '未知错误'}`);
-            process.exit(1);
+            printError('SERVER_ERROR', `查询失败：${(results && results.err) || '未知错误'}`);
         }
     } catch (error) {
-        console.error(`❌ 错误：${error.message}`);
-        process.exit(1);
+        failWith(error);
     }
 }
 

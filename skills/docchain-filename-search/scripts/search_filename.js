@@ -141,8 +141,7 @@ function parseArgs(argv, argSpec) {
         }
         const spec = argSpec[name];
         if (!spec) {
-            console.error(`❌ 错误：未知参数：${arg}`);
-            process.exit(1);
+            printError('CONFIG', `未知参数：${arg}`);
         }
         if (spec.flag) {
             args[name] = true;
@@ -152,14 +151,12 @@ function parseArgs(argv, argSpec) {
             value = argv[i + 1];
             i += 1;
             if (value === undefined) {
-                console.error(`❌ 错误：参数 ${arg} 缺少值`);
-                process.exit(1);
+                printError('CONFIG', `参数 ${arg} 缺少值`);
             }
         }
         if (spec.type === 'int') {
             if (!/^\d+$/.test(value)) {
-                console.error(`❌ 错误：参数 ${arg} 必须是数字`);
-                process.exit(1);
+                printError('CONFIG', `参数 ${arg} 必须是数字`);
             }
             value = parseInt(value, 10);
         }
@@ -167,12 +164,10 @@ function parseArgs(argv, argSpec) {
     }
     for (const [name, spec] of Object.entries(argSpec)) {
         if (spec.required && (args[name] === null || args[name] === undefined)) {
-            console.error(`❌ 错误：缺少必填参数 --${name}`);
-            process.exit(1);
+            printError('CONFIG', `缺少必填参数 --${name}`);
         }
         if (spec.choices && args[name] !== null && !spec.choices.includes(args[name])) {
-            console.error(`❌ 错误：参数 --${name} 取值必须是 ${spec.choices.join('/')}`);
-            process.exit(1);
+            printError('CONFIG', `参数 --${name} 取值必须是 ${spec.choices.join('/')}`);
         }
     }
     return args;
@@ -191,8 +186,7 @@ function parseIdList(value, label) {
         const trimmed = item.trim();
         if (!trimmed) continue;
         if (!/^\d+$/.test(trimmed)) {
-            console.error(`❌ 错误：${label} 必须是数字`);
-            process.exit(1);
+            printError('CONFIG', `${label} 必须是数字`);
         }
         ids.push(Number(trimmed));
     }
@@ -255,27 +249,40 @@ function getConfig() {
     }
 
     if (!config.docchain_url || !config.docchain_api_key) {
-        console.log(JSON.stringify({ error: '配置不完整', message: CONFIG_MESSAGE }));
-        process.exit(1);
+        printError('CONFIG', CONFIG_MESSAGE);
     }
     return config;
 }
 
 /**
- * Print a failure to stderr with a friendly message, then exit(1).
- * HTTP errors map per status code; anything else is treated as a
- * network/transport failure.
+ * Print a structured failure envelope `{ok:false, error, message}` on stdout
+ * and exit. `NO_RESULTS` is treated as a normal empty result (exit 0); any
+ * other code exits 1.
+ * @param {string} error - CONFIG|NO_RESULTS|NOT_FOUND|NO_PERMISSION|SERVER_ERROR
+ * @param {string} message
+ */
+function printError(error, message) {
+    console.log(JSON.stringify({ ok: false, error, message }));
+    process.exit(error === 'NO_RESULTS' ? 0 : 1);
+}
+
+/**
+ * Print a failure as a structured envelope, then exit.
+ * HTTP errors map per status code; anything else is a network failure.
  * @param {Error} error
  * @param {object} [statusMessages] - HTTP status code to friendly message
  */
 function failWith(error, statusMessages = {}) {
     if (error instanceof HttpError) {
-        const message = statusMessages[error.status] || `API 请求失败：HTTP ${error.status}`;
-        console.error(`❌ 错误：${message}`);
-    } else {
-        console.error(`❌ 错误：网络错误：${error.message}`);
+        if (error.status === 401 || error.status === 403) {
+            printError('NO_PERMISSION', statusMessages[error.status] || '无权限访问文档或主题');
+        }
+        if (error.status >= 500) {
+            printError('SERVER_ERROR', '服务端错误（HTTP ' + error.status + '）');
+        }
+        printError('SERVER_ERROR', statusMessages[error.status] || `API 请求失败：HTTP ${error.status}`);
     }
-    process.exit(1);
+    printError('SERVER_ERROR', `网络错误：${error.message}`);
 }
 
 /**
@@ -301,8 +308,7 @@ async function searchByFilename(keywords, topicIds) {
     // 调用 API
     const { data } = await requestJson(endpoint, { method: 'POST', headers, body: payload });
     if (data && data.success === false) {
-        console.log(`API请求失败: ${data.err}`);
-        process.exit(1);
+        printError('SERVER_ERROR', `API请求失败: ${data.err || '未知错误'}`);
     }
     return data;
 }
@@ -338,6 +344,25 @@ function formatResults(data) {
     return lines.join('\n');
 }
 
+/**
+ * 构造机器可读摘要（成功时附在可读输出之后）。
+ * @param {object} data - API 响应数据
+ * @returns {object}
+ */
+function buildPayload(data) {
+    return {
+        ok: true,
+        mode: 'filename',
+        keywords: data.keywords || [],
+        total: data.total || 0,
+        documents: (data.results || []).map((result) => ({
+            doc_id: result.doc_id,
+            doc_name: result.doc_name,
+            topic_id: result.topic_id,
+        })),
+    };
+}
+
 async function main() {
     const args = parseArgs(process.argv.slice(2), ARG_SPEC);
 
@@ -347,13 +372,11 @@ async function main() {
     // 解析关键词
     const keywords = splitList(args.keywords);
     if (keywords.length === 0) {
-        console.error('❌ 错误：未提供关键词');
-        process.exit(1);
+        printError('CONFIG', '错误：未提供关键词');
     }
 
     if (!topicIds) {
-        console.error('❌ 错误：必须提供 --topic_ids 参数');
-        process.exit(1);
+        printError('CONFIG', '错误：必须提供 --topic_ids 参数');
     }
 
     try {
@@ -362,6 +385,7 @@ async function main() {
 
         // 显示结果
         console.log(formatResults(results));
+        console.log(JSON.stringify(buildPayload(results)));
     } catch (error) {
         failWith(error, { 403: '无权限访问主题', 404: '主题不存在' });
     }

@@ -89,10 +89,21 @@ function getConfig() {
     }
 
     if (!config.docchain_url || !config.docchain_api_key) {
-        console.log(JSON.stringify({ error: '配置不完整', message: CONFIG_MESSAGE }));
-        process.exit(1);
+        printError('CONFIG', CONFIG_MESSAGE);
     }
     return config;
+}
+
+/**
+ * Print a structured failure envelope `{ok:false, error, message}` on stdout
+ * and exit. `NO_RESULTS` is treated as a normal empty result (exit 0); any
+ * other code exits 1.
+ * @param {string} error - CONFIG|NO_RESULTS|NOT_FOUND|NO_PERMISSION|SERVER_ERROR
+ * @param {string} message
+ */
+function printError(error, message) {
+    console.log(JSON.stringify({ ok: false, error, message }));
+    process.exit(error === 'NO_RESULTS' ? 0 : 1);
 }
 
 /**
@@ -184,18 +195,18 @@ class DocchainUploader {
             const response = await uploadMultipart(fullUrl, headers, { filename, content });
 
             if (response.status >= 400) {
-                console.log(`API请求失败: HTTP ${response.status}\n响应内容: ${response.text}`);
-                process.exit(1);
+                if (response.status === 401 || response.status === 403) {
+                    printError('NO_PERMISSION', `无权限上传到该主题（HTTP ${response.status}）`);
+                }
+                printError('SERVER_ERROR', `API请求失败: HTTP ${response.status} ${response.text}`);
             }
             const data = response.data;
             if (data && data.success === false) {
-                console.log(`API请求失败: ${data.err}`);
-                process.exit(1);
+                printError('SERVER_ERROR', `API请求失败: ${data.err || '未知错误'}`);
             }
             return data;
         } catch (error) {
-            console.log(`API请求失败: ${error.message}`);
-            process.exit(1);
+            printError('SERVER_ERROR', `API请求失败: ${error.message}`);
         }
     }
 
@@ -334,15 +345,13 @@ async function main() {
         }
         if (value !== undefined) {
             if (!/^\d+$/.test(value)) {
-                console.error('❌ 错误：topic_id 必须是数字');
-                process.exit(1);
+                printError('CONFIG', '错误：topic_id 必须是数字');
             }
             topicId = parseInt(value, 10);
         }
     }
     if (topicId === null) {
-        console.error('❌ 错误：缺少必填参数 --topic_id');
-        process.exit(1);
+        printError('CONFIG', '错误：缺少必填参数 --topic_id');
     }
 
     // 初始化上传器
@@ -351,13 +360,12 @@ async function main() {
     // 执行命令
     if (command === 'upload-file') {
         const result = await uploader.uploadFile(targetPath, topicId);
-        console.log(JSON.stringify(result));
+        console.log(JSON.stringify(Object.assign({ ok: result.success === true }, result)));
     } else if (command === 'upload-folder') {
         const files = uploader.scanFiles(targetPath);
 
         if (files.length === 0) {
-            console.log('未找到匹配的文件');
-            process.exit(1);
+            printError('NO_RESULTS', '未找到匹配的文件');
         }
 
         console.log(`\n找到 ${files.length} 个文件:`);
@@ -368,7 +376,8 @@ async function main() {
             console.log(`  ... 还有 ${files.length - 10} 个文件`);
         }
 
-        await uploader.batchUpload(files, topicId);
+        const summary = await uploader.batchUpload(files, topicId);
+        console.log(JSON.stringify(Object.assign({ ok: summary.failed === 0, mode: 'batch' }, summary)));
     } else {
         console.log(USAGE);
         process.exit(1);

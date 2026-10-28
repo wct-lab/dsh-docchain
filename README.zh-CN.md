@@ -8,7 +8,8 @@
 
 | 技能 | 形态 | 说明 |
 |---|---|---|
-| `docchain-filename-search` | SKILL.md + Node.js 脚本 | 按文件名关键词跨主题查找文档 |
+| `docchain-filename-search` | SKILL.md + Node.js 脚本 | 在指定主题内按文件名关键词查找文档 |
+| `docchain-doc-search` | SKILL.md + Node.js 脚本 | 按 doc_id 或文档名称关键字定位文档、列出详情，并可读取指定文档正文（分段续读） |
 | `docchain-content-search` | SKILL.md + Node.js 脚本 | 在文档内容中搜索关键词，返回行号和内容，支持"或/且" |
 | `docchain-meta-search` | SKILL.md + Node.js 脚本 | 按自定义元数据字段查询文档（字符串/数值/时间，精确与范围） |
 | `docchain-topic-info` | SKILL.md + Node.js 脚本 | 查询 docchain 主题列表，支持分页与名称/ID 关键字过滤 |
@@ -133,16 +134,33 @@ Bundle 插入一个 Host 插件（`dsh-docchain`），激活时在 `ctx.skills` 
 
 ## 技能详解
 
-### docchain-filename-search（按文件名搜索）
+### docchain-filename-search（在指定主题内按文件名搜索）
 
-通过文件名关键词快速定位文档，支持跨主题搜索。
+在**指定主题范围内**按文件名关键词定位文档。
 
-**交互方式**：描述要查找的文件名关键词。提问时必须指定主题 ID。
+**交互方式**：描述要查找的文件名关键词，**必须指定主题 ID**（本技能只在这些主题里找）。
+
+> 与 `docchain-doc-search` 的分工：若要**跨全部主题**按文件名查找，或用 doc_id 定位、读文档正文，请用 `docchain-doc-search`；本技能是"限定主题 + 只按文件名"。
 
 **示例**：
 
 - "帮我在主题112中找文档名包含'合同'的文件"
 - "在主题1,10里搜索'采购'或'协议'的文档"
+
+### docchain-doc-search（按文档 ID / 文档名称定位并读正文）
+
+按 doc_id 或文档名称关键字找到"是哪个文档"，列出详情（名称、所属主题、页数、大小、状态）；需要时可读取指定文档的正文（分段返回，用 `next_offset` 续读）。用于"这个 id 是哪份文档""名字带 XX 的文档有哪些""把某份文档的正文读出来"。
+
+**交互方式**：给出一个或多个文档 ID，或一个文档名称关键字（`--keyword` 为全库跨主题搜索）；要读正文时指定单个文档 ID 加 `--content`。
+
+> 与 `docchain-filename-search` 的区别：本技能按文件名全库搜、且能按 doc_id 查详情与读正文；只想在某个主题内按文件名找，用 `docchain-filename-search`。与 `docchain-content-search` 的区别：本技能按 doc_id / 文档名找文档本身，不是在正文里搜关键词。
+
+**示例**：
+
+- "查一下文档 125672 是什么"
+- "125672 和 125755 分别是哪两份文档"
+- "找一下名字带'评价标准'的文档"
+- "把文档 125755 的开头读出来"
 
 ### docchain-content-search（文档内容搜索）
 

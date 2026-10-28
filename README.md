@@ -8,7 +8,8 @@ Its configuration page goes beyond a single endpoint: it keeps a list of **saved
 
 | Skill | Kind | Description |
 |---|---|---|
-| `docchain-filename-search` | SKILL.md + Node.js script | Find documents whose filename matches keywords, across topics |
+| `docchain-filename-search` | SKILL.md + Node.js script | Find documents whose filename matches keywords, within the given topics |
+| `docchain-doc-search` | SKILL.md + Node.js script | Locate documents by doc_id or document-name keyword, show their details, and optionally read a document's content (paged, resumable) |
 | `docchain-content-search` | SKILL.md + Node.js script | Search document content by keyword; returns line numbers and content; `or`/`and` operators |
 | `docchain-meta-search` | SKILL.md + Node.js script | Query documents by custom metadata fields (string/number/time, exact and range) |
 | `docchain-topic-info` | SKILL.md + Node.js script | List docchain topics with pagination and a name-or-id keyword filter |
@@ -133,16 +134,33 @@ The bundle inserts one Host plugin (`dsh-docchain`). At activation it registers 
 
 ## Skills
 
-### docchain-filename-search — find documents by filename
+### docchain-filename-search — find documents by filename within given topics
 
-Locate documents quickly by filename keywords across topics.
+Locate documents by filename keywords **within the specified topics**.
 
-**How to use it** — describe the filename keywords you are looking for. You must specify the topic ID(s) when asking.
+**How to use it** — describe the filename keywords you are looking for. You **must** specify the topic ID(s); this skill searches only inside those topics.
+
+> Division of labour with `docchain-doc-search`: to search filenames **across all topics**, or to locate by doc_id or read a document's content, use `docchain-doc-search`. This skill is "scoped to topics + filename only".
 
 **Examples:**
 
 - "Find documents whose filename contains 'contract' in topic 112"
 - "Search for documents with 'purchase' or 'agreement' in topics 1 and 10"
+
+### docchain-doc-search — locate by doc_id / document name and read content
+
+Find out "which document is this" by doc_id or by a document-name keyword, and list its details (name, topic, pages, size, state). When needed, read a document's content in pages (resume with `next_offset`). Use it for "what document is id X", "which documents have a name containing XX", or "read me the content of a document".
+
+**How to use it** — give one or more document IDs, or a document-name keyword (`--keyword` searches filenames across all topics); to read content, pass a single document ID with `--content`.
+
+> Unlike `docchain-filename-search`, this searches filenames across all topics and can resolve by doc_id or read content; to look up a filename only within a specific topic, use `docchain-filename-search`. Unlike `docchain-content-search`, this locates the document itself by id / name rather than grepping keywords inside its content.
+
+**Examples:**
+
+- "What is document 125672?"
+- "What are documents 125672 and 125755?"
+- "Find documents whose name contains 'evaluation standard'"
+- "Read the beginning of document 125755"
 
 ### docchain-content-search — search document content
 
