@@ -226,10 +226,21 @@ function getConfig() {
     }
 
     if (!config.docchain_url || !config.docchain_api_key) {
-        console.log(JSON.stringify({ error: '配置不完整', message: CONFIG_MESSAGE }));
-        process.exit(1);
+        printError('CONFIG', CONFIG_MESSAGE);
     }
     return config;
+}
+
+/**
+ * Print a structured failure envelope `{ok:false, error, message}` on stdout
+ * and exit. `NO_RESULTS` is treated as a normal empty result (exit 0); any
+ * other code exits 1.
+ * @param {string} error - CONFIG|NO_RESULTS|NOT_FOUND|NO_PERMISSION|SERVER_ERROR
+ * @param {string} message
+ */
+function printError(error, message) {
+    console.log(JSON.stringify({ ok: false, error, message }));
+    process.exit(error === 'NO_RESULTS' ? 0 : 1);
 }
 
 /**
@@ -254,8 +265,7 @@ async function listTopics(page = 1, size = 20, keyword = null) {
         const { data } = await requestJson(endpoint, { method: 'GET', headers });
 
         if (data && data.success === false) {
-            console.log(JSON.stringify({ error: '查询主题列表失败', message: data.err || '未知错误' }));
-            process.exit(1);
+            printError('SERVER_ERROR', `查询主题列表失败：${data.err || '未知错误'}`);
         }
 
         // API 返回结构是 {"success":true,"data":{"total":X,"data":[...]}}
@@ -271,8 +281,16 @@ async function listTopics(page = 1, size = 20, keyword = null) {
         }
         return result;
     } catch (error) {
-        console.log(JSON.stringify({ error: '查询主题列表失败', message: error.message, url }));
-        process.exit(1);
+        if (error instanceof HttpError) {
+            if (error.status === 401 || error.status === 403) {
+                printError('NO_PERMISSION', '无权限访问主题列表（HTTP ' + error.status + '）');
+            }
+            if (error.status >= 500) {
+                printError('SERVER_ERROR', '服务端错误（HTTP ' + error.status + '）');
+            }
+            printError('SERVER_ERROR', 'API 请求失败：HTTP ' + error.status);
+        }
+        printError('SERVER_ERROR', `查询主题列表失败：${error.message}`);
     }
 }
 
@@ -313,8 +331,8 @@ async function main() {
     // 查询主题列表
     const result = await listTopics(args.page, args.size, args.keyword);
 
-    // 直接输出 JSON 格式
-    console.log(JSON.stringify(formatResults(result)));
+    // 直接输出 JSON 格式（统一带 ok:true）
+    console.log(JSON.stringify(Object.assign({ ok: true, mode: 'topics' }, formatResults(result))));
 }
 
 if (require.main === module) {
