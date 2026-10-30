@@ -60,6 +60,19 @@ function fail(code, message, extra) {
     process.exit(code === 'NO_RESULTS' ? 0 : 1);
 }
 
+/**
+ * A business failure carrying the same error vocabulary as the tool layer.
+ * The compute path throws this instead of printing and exiting, so the same
+ * code serves both the CLI and the in-process tool registration.
+ */
+class DocchainError extends Error {
+    constructor(code, message) {
+        super(message);
+        this.name = 'DocchainError';
+        this.code = code;
+    }
+}
+
 /** 解析 `--flag value` / `--flag=value` 参数。 */
 function parseArgs(argv) {
     const args = {};
@@ -350,60 +363,66 @@ async function mapLimit(items, limit, worker) {
     return results;
 }
 
-async function main() {
-    const args = parseArgs(process.argv.slice(2));
-    const config = getConfig();
+/**
+ * 图搜图主流程：校验 → 上传一次 → 按主题并发检索 → 合并排序 → 下载命中图。
+ * CLI 与宿主工具共用这一条路径；内部只抛 DocchainError，不打印、不退出。
+ *
+ * @param {object} config - { url, key, topicIds }
+ * @param {object} params - { image, topicIds, all, limit, concurrency, maxSeconds }
+ * @returns {Promise<object>} 结构化 payload
+ */
+async function runImageSearch(config, params = {}) {
     const root = apiRoot(config.url);
-    const imagePath = args.image;
+    const quiet = params.quiet !== false;
+    const say = (line) => {
+        if (!quiet) console.error(line);
+    };
+
+    const imagePath = params.image;
     if (!imagePath) {
-        fail('CONFIG', '缺少 --image 参数：请提供一张本地图片的路径。');
+        throw new DocchainError('CONFIG', '缺少 image 参数：请提供一张本地图片的路径。');
     }
     if (!fs.existsSync(imagePath) || !fs.statSync(imagePath).isFile()) {
-        fail('CONFIG', `图片不存在或不是文件：${imagePath}`);
+        throw new DocchainError('CONFIG', `图片不存在或不是文件：${imagePath}`);
     }
     const size = fs.statSync(imagePath).size;
     if (size > MAX_IMAGE_BYTES) {
-        fail('CONFIG', `图片过大（${Math.round(size / 1024 / 1024)}MB），上限 20MB。`);
+        throw new DocchainError('CONFIG', `图片过大（${Math.round(size / 1024 / 1024)}MB），上限 20MB。`);
     }
     const ext = path.extname(imagePath).toLowerCase();
     if (!ALLOWED_EXTENSIONS.includes(ext)) {
-        fail('CONFIG', `不支持的图片格式：${ext || '(无扩展名)'}；支持 ${ALLOWED_EXTENSIONS.join(' ')}`);
+        throw new DocchainError('CONFIG', `不支持的图片格式：${ext || '(无扩展名)'}；支持 ${ALLOWED_EXTENSIONS.join(' ')}`);
     }
 
-    const limit = Math.min(MAX_LIMIT, Math.max(1, args.limit || DEFAULT_LIMIT));
-    const concurrency = Math.min(MAX_CONCURRENCY, Math.max(1, args.concurrency || DEFAULT_CONCURRENCY));
+    const limit = Math.min(MAX_LIMIT, Math.max(1, params.limit || DEFAULT_LIMIT));
+    const concurrency = Math.min(MAX_CONCURRENCY, Math.max(1, params.concurrency || DEFAULT_CONCURRENCY));
     const startedAt = Date.now();
 
-    // 检索范围优先级：--topic_ids > --all > 配置页选中主题（与 SKILL.md 一致）
+    // 检索范围优先级：显式主题 > 全库 > 配置页选中主题（与 SKILL.md 一致）
     let topicIds = [];
     let scannedAll = false;
-    if (args.topic_ids) {
-        topicIds = String(args.topic_ids)
-            .split(',')
-            .map((value) => Number(String(value).trim()))
-            .filter((id) => Number.isInteger(id) && id > 0);
-        if (topicIds.length === 0) fail('CONFIG', '--topic_ids 里没有有效的主题 ID。');
-        if (args.all) {
-            console.error('提示：同时给了 --topic_ids 和 --all，按 --topic_ids 指定的范围检索。');
-        }
-    } else if (args.all) {
+    if (Array.isArray(params.topicIds) && params.topicIds.length > 0) {
+        topicIds = params.topicIds.filter((id) => Number.isInteger(id) && id > 0);
+        if (topicIds.length === 0) throw new DocchainError('CONFIG', 'topic_ids 里没有有效的主题 ID。');
+        if (params.all) say('提示：同时给了 topic_ids 和 all，按 topic_ids 指定的范围检索。');
+    } else if (params.all) {
         scannedAll = true;
         try {
             topicIds = await listAllTopicIds(root, config.key);
         } catch (error) {
-            fail('SERVER_ERROR', `拉取主题列表失败：${error.message}`);
+            throw new DocchainError('SERVER_ERROR', `拉取主题列表失败：${error.message}`);
         }
-        if (topicIds.length === 0) fail('NO_RESULTS', '当前环境没有任何主题。');
+        if (topicIds.length === 0) throw new DocchainError('NO_RESULTS', '当前环境没有任何主题。');
     }
     if (topicIds.length === 0) {
-        topicIds = config.topicIds;
+        topicIds = config.topicIds || [];
     }
     // 同一主题写两次不值得发两次请求，也不该让结果被重复合并。
     topicIds = [...new Set(topicIds)];
     if (topicIds.length === 0) {
-        fail(
+        throw new DocchainError(
             'CONFIG',
-            '未选择主题：请在插件配置页为当前环境选择主题，或用 --topic_ids 指定，或用 --all 扫描全部主题。',
+            '未选择主题：请在插件配置页为当前环境选择主题，或指定 topic_ids，或用 all 扫描全部主题。',
         );
     }
 
@@ -412,12 +431,12 @@ async function main() {
     try {
         filePath = await uploadImage(root, config.key, imagePath, topicIds[0]);
     } catch (error) {
-        fail('UPLOAD_FAILED', `图片上传失败：${error.message}`);
+        throw new DocchainError('SERVER_ERROR', `图片上传失败：${error.message}`);
     }
 
     const warnings = [];
     let timedOut = false;
-    const deadline = startedAt + (args['max-seconds'] || DEFAULT_MAX_SECONDS) * 1000;
+    const deadline = startedAt + (params.maxSeconds || DEFAULT_MAX_SECONDS) * 1000;
     let scanned = 0;
     const perTopic = await mapLimit(topicIds, concurrency, async (topicId) => {
         if (Date.now() > deadline) {
@@ -426,7 +445,7 @@ async function main() {
         }
         scanned += 1;
         if (topicIds.length > 20 && scanned % 50 === 0) {
-            console.error(`… 已扫描 ${scanned}/${topicIds.length} 个主题`);
+            say(`… 已扫描 ${scanned}/${topicIds.length} 个主题`);
         }
         try {
             return await searchTopic(root, config.key, topicId, filePath);
@@ -479,27 +498,48 @@ async function main() {
         msgParts.push(
             '若你确认库里有这张图：图片向量是按主题建立的，说明这些主题还没有做图片向量化（实测同一实例上有向量的主题能命中、没有的恒为空），需要服务端对相应主题补跑图片向量。',
         );
-        fail('NO_RESULTS', msgParts.join(' '), {
-            scanned,
-            total: topicIds.length,
-            elapsed_ms: Date.now() - startedAt,
-            warnings,
-        });
+        throw new DocchainError('NO_RESULTS', msgParts.join(' '));
     }
 
-    console.log(
-        JSON.stringify({
-            ok: true,
-            mode: 'image',
-            query: { image: imagePath, topics: topicIds },
-            scanned,
-            total: topicIds.length,
-            elapsed_ms: Date.now() - startedAt,
-            dir,
-            items,
-            warnings,
-        }),
-    );
+    return {
+        ok: true,
+        mode: 'image',
+        query: { image: imagePath, topics: topicIds },
+        scanned,
+        total: topicIds.length,
+        elapsed_ms: Date.now() - startedAt,
+        dir,
+        items,
+        warnings,
+    };
+}
+
+async function main() {
+    const args = parseArgs(process.argv.slice(2));
+    const config = getConfig();
+    const rawTopics = args.topic_ids
+        ? String(args.topic_ids)
+            .split(',')
+            .map((value) => Number(String(value).trim()))
+            .filter((id) => Number.isInteger(id) && id > 0)
+        : null;
+    try {
+        const payload = await runImageSearch(
+            { url: config.url, key: config.key, topicIds: config.topicIds },
+            {
+                image: args.image,
+                topicIds: rawTopics,
+                all: args.all,
+                limit: args.limit,
+                concurrency: args.concurrency,
+                maxSeconds: args['max-seconds'],
+                quiet: false,
+            },
+        );
+        console.log(JSON.stringify(payload));
+    } catch (error) {
+        fail(error.code || 'SERVER_ERROR', error.message);
+    }
 }
 
 if (require.main === module) {
@@ -507,3 +547,11 @@ if (require.main === module) {
         fail('SERVER_ERROR', error && error.message ? error.message : String(error));
     });
 }
+
+// The host half calls these directly (in-process tool execution).
+module.exports = {
+    runImageSearch,
+    getConfig,
+    DocchainError,
+    ALLOWED_EXTENSIONS,
+};

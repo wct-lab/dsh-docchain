@@ -275,6 +275,9 @@ function printError(error, message) {
  * @param {object} [statusMessages] - HTTP status code to friendly message
  */
 function failWith(error, statusMessages = {}) {
+    if (error instanceof DocchainError) {
+        printError(error.code, error.message);
+    }
     if (error instanceof HttpError) {
         if (error.status === 401 || error.status === 403) {
             printError('NO_PERMISSION', statusMessages[error.status] || '无权限访问文档或主题');
@@ -288,13 +291,25 @@ function failWith(error, statusMessages = {}) {
 }
 
 /**
+ * A business failure carrying the same error vocabulary as the tool layer.
+ * Pure functions throw this instead of printing and exiting, so the same code
+ * serves both the CLI and the in-process tool registration.
+ */
+class DocchainError extends Error {
+    constructor(code, message) {
+        super(message);
+        this.name = 'DocchainError';
+        this.code = code;
+    }
+}
+
+/**
  * 查询主题的元数据字段列表。
+ * @param {object} config - { docchain_url, docchain_api_key }
  * @param {number} topicId
  * @returns {Promise<object>} API 响应
  */
-async function listTopicMetadataFields(topicId) {
-    const config = getConfig();
-
+async function listTopicMetadataFields(config, topicId) {
     const apiUrl = config.docchain_url.replace(/\/+$/, '');
     const endpoint = `${apiUrl}/v1/topic/metadata/list?topic_id=${encodeURIComponent(topicId)}`;
 
@@ -383,9 +398,7 @@ function parseCondition(conditionStr) {
  * @param {number} params.size - 返回结果数量上限
  * @returns {Promise<object>} API 响应
  */
-async function queryByMetaFields({ conditions, topicIds, docIds, orGroups, size }) {
-    const config = getConfig();
-
+async function queryByMetaFields(config, { conditions, topicIds, docIds, orGroups, size }) {
     const apiUrl = config.docchain_url.replace(/\/+$/, '');
     const endpoint = `${apiUrl}/v1/doc_info/meta_field_query`;
 
@@ -500,6 +513,103 @@ function buildQueryPayload(data, conditionsStr) {
     };
 }
 
+/**
+ * 把工具层传来的 `{field, op, value}`（或 API 原生 `{field_name, operation, value}`）
+ * 归一化成接口要求的条件对象。
+ * @param {object} raw
+ * @returns {object|null} null 表示不合法
+ */
+function normalizeCondition(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const field = raw.field_name ?? raw.field;
+    const operation = raw.operation ?? raw.op;
+    const value = raw.value;
+    if (field === undefined || field === null || String(field) === '') return null;
+    if (!operation || !VALID_OPERATIONS.has(String(operation))) return null;
+    if (value === undefined || value === null) return null;
+    return { field_name: String(field), operation: String(operation), value: String(value) };
+}
+
+/**
+ * 字段结构模式：列出若干主题的元数据字段。
+ * @param {object} config
+ * @param {number[]} topicIds
+ * @returns {Promise<object>} 结构化 payload
+ */
+async function runMetaFields(config, topicIds) {
+    if (!Array.isArray(topicIds) || topicIds.length === 0) {
+        throw new DocchainError('CONFIG', 'list_fields 模式需要提供 topic_ids');
+    }
+    const topics = [];
+    for (const topicId of topicIds) {
+        const result = await listTopicMetadataFields(config, topicId);
+        if (result && result.success) {
+            topics.push({ topic_id: topicId, fields: result.data || [] });
+        } else {
+            topics.push({ topic_id: topicId, error: (result && result.err) || '未知错误' });
+        }
+    }
+    return { ok: true, mode: 'fields', topics };
+}
+
+/**
+ * 条件查询模式：按元数据字段筛选文档。
+ * CLI 与宿主工具共用这一条路径。
+ * @param {object} config
+ * @param {object} params - { conditions, orGroups, topicIds, docIds, size, conditionsStr }
+ * @returns {Promise<object>} 结构化 payload
+ */
+async function runMetaQuery(config, params = {}) {
+    const conditions = [];
+    for (const raw of params.conditions || []) {
+        const parsed = normalizeCondition(raw);
+        if (!parsed) {
+            throw new DocchainError(
+                'CONFIG',
+                `条件不合法：${JSON.stringify(raw)}；需要 {field, op, value}，op 取值如 eq/ne/contains/num_gt/time_lt`,
+            );
+        }
+        conditions.push(parsed);
+    }
+
+    const orGroups = [];
+    for (const group of params.orGroups || []) {
+        const parsedGroup = [];
+        for (const raw of group || []) {
+            const parsed = normalizeCondition(raw);
+            if (!parsed) {
+                throw new DocchainError('CONFIG', `OR 组内条件不合法：${JSON.stringify(raw)}`);
+            }
+            parsedGroup.push(parsed);
+        }
+        if (parsedGroup.length > 0) orGroups.push(parsedGroup);
+    }
+
+    const topicIds = Array.isArray(params.topicIds) && params.topicIds.length ? params.topicIds : null;
+    const docIds = Array.isArray(params.docIds) && params.docIds.length ? params.docIds : null;
+    if (!topicIds && !docIds) {
+        throw new DocchainError('CONFIG', '必须提供 topic_ids 或 doc_ids 之一');
+    }
+
+    const results = await queryByMetaFields(config, {
+        conditions,
+        topicIds,
+        docIds,
+        orGroups: orGroups.length > 0 ? orGroups : null,
+        size: params.size ?? 100,
+    });
+    if (!results || !results.success) {
+        throw new DocchainError('SERVER_ERROR', `查询失败：${(results && results.err) || '未知错误'}`);
+    }
+    // 没有现成的条件描述时，从条件对象反推，保证 payload 里的 conditions 不为空。
+    const describe = (list) => list.map((c) => `${c.field_name} ${c.operation} ${c.value}`).join(' AND ');
+    const derived = params.conditionsStr || [
+        conditions.length ? describe(conditions) : '',
+        ...orGroups.map((group) => `(${group.map((c) => `${c.field_name} ${c.operation} ${c.value}`).join(' OR ')})`),
+    ].filter(Boolean).join(' AND ');
+    return buildQueryPayload(results.data || {}, derived);
+}
+
 async function main() {
     const args = parseArgs(process.argv.slice(2), ARG_SPEC);
 
@@ -509,28 +619,21 @@ async function main() {
     // 解析文档 ID
     const docIds = args.doc_ids ? parseIdList(args.doc_ids, '文档 ID') : null;
 
-    getConfig();
+    const config = getConfig();
 
     // --list_fields 模式：仅列出字段结构
     if (args.list_fields) {
-        if (!topicIds) {
-            printError('CONFIG', '错误：--list_fields 需要指定主题 ID（--topic_ids）');
-        }
-
         try {
-            const fieldsPayload = [];
-            for (const topicId of topicIds) {
-                const result = await listTopicMetadataFields(topicId);
-                if (result && result.success) {
-                    console.log(formatMetadataFields(result.data || [], topicId));
-                    fieldsPayload.push({ topic_id: topicId, fields: result.data || [] });
+            const payload = await runMetaFields(config, topicIds);
+            for (const topic of payload.topics) {
+                if (topic.error) {
+                    console.log(`❌ 主题 ${topic.topic_id} 查询失败：${topic.error}`);
                 } else {
-                    console.log(`❌ 主题 ${topicId} 查询失败：${(result && result.err) || '未知错误'}`);
-                    fieldsPayload.push({ topic_id: topicId, error: (result && result.err) || '未知错误' });
+                    console.log(formatMetadataFields(topic.fields, topic.topic_id));
                 }
-                console.log(); // 主题之间空一行
+                console.log();
             }
-            console.log(JSON.stringify({ ok: true, mode: 'fields', topics: fieldsPayload }));
+            console.log(JSON.stringify(payload));
         } catch (error) {
             failWith(error);
         }
@@ -594,21 +697,20 @@ async function main() {
     }
 
     try {
-        const results = await queryByMetaFields({
+        // 直接用原始响应渲染可读表格，再用归一化 payload 输出机器可读 JSON。
+        const results = await queryByMetaFields(config, {
             conditions,
             topicIds,
             docIds,
             orGroups: orGroups.length > 0 ? orGroups : null,
             size: args.size,
         });
-
-        if (results && results.success) {
-            const data = results.data || {};
-            console.log(formatResults(data, fullConditionsStr));
-            console.log(JSON.stringify(buildQueryPayload(data, fullConditionsStr)));
-        } else {
+        if (!results || !results.success) {
             printError('SERVER_ERROR', `查询失败：${(results && results.err) || '未知错误'}`);
         }
+        const data = results.data || {};
+        console.log(formatResults(data, fullConditionsStr));
+        console.log(JSON.stringify(buildQueryPayload(data, fullConditionsStr)));
     } catch (error) {
         failWith(error);
     }
@@ -617,3 +719,20 @@ async function main() {
 if (require.main === module) {
     main();
 }
+
+// The host half calls these directly (in-process tool execution).
+module.exports = {
+    listTopicMetadataFields,
+    queryByMetaFields,
+    parseCondition,
+    normalizeCondition,
+    runMetaFields,
+    runMetaQuery,
+    buildQueryPayload,
+    formatResults,
+    formatMetadataFields,
+    VALID_OPERATIONS,
+    getConfig,
+    HttpError,
+    DocchainError,
+};

@@ -170,9 +170,32 @@ function uploadMultipart(url, headers, { filename, content }) {
     });
 }
 
+/**
+ * A business failure carrying the same error vocabulary as the tool layer.
+ * Pure functions throw this instead of printing and exiting, so the same code
+ * serves both the CLI and the in-process tool registration.
+ */
+class DocchainError extends Error {
+    constructor(code, message) {
+        super(message);
+        this.name = 'DocchainError';
+        this.code = code;
+    }
+}
+
 class DocchainUploader {
-    constructor() {
-        this.config = getConfig();
+    /**
+     * @param {object|null} config - 传入时直接使用（工具层）；省略则按配置链读取（CLI）
+     * @param {boolean} quiet - true 时不上报进度（工具层）
+     */
+    constructor(config = null, quiet = false) {
+        this.config = config || getConfig();
+        this.quiet = quiet;
+    }
+
+    /** 进度输出：工具层静默，CLI 照常。 */
+    log(line = '') {
+        if (!this.quiet) console.log(line);
     }
 
     /**
@@ -196,17 +219,18 @@ class DocchainUploader {
 
             if (response.status >= 400) {
                 if (response.status === 401 || response.status === 403) {
-                    printError('NO_PERMISSION', `无权限上传到该主题（HTTP ${response.status}）`);
+                    throw new DocchainError('NO_PERMISSION', `无权限上传到该主题（HTTP ${response.status}）`);
                 }
-                printError('SERVER_ERROR', `API请求失败: HTTP ${response.status} ${response.text}`);
+                throw new DocchainError('SERVER_ERROR', `API请求失败: HTTP ${response.status} ${response.text}`);
             }
             const data = response.data;
             if (data && data.success === false) {
-                printError('SERVER_ERROR', `API请求失败: ${data.err || '未知错误'}`);
+                throw new DocchainError('SERVER_ERROR', `API请求失败: ${data.err || '未知错误'}`);
             }
             return data;
         } catch (error) {
-            printError('SERVER_ERROR', `API请求失败: ${error.message}`);
+            if (error instanceof DocchainError) throw error;
+            throw new DocchainError('SERVER_ERROR', `API请求失败: ${error.message}`);
         }
     }
 
@@ -253,8 +277,7 @@ class DocchainUploader {
         const files = [];
 
         if (!fs.existsSync(folderPath)) {
-            console.log(`错误: 路径不存在: ${folderPath}`);
-            return files;
+            throw new DocchainError('NOT_FOUND', `路径不存在: ${folderPath}`);
         }
 
         if (fs.statSync(folderPath).isFile()) {
@@ -286,33 +309,33 @@ class DocchainUploader {
         let failedCount = 0;
         const results = [];
 
-        console.log(`\n开始批量上传，共 ${total} 个文件\n`);
+        this.log(`\n开始批量上传，共 ${total} 个文件\n`);
 
         for (let idx = 0; idx < files.length; idx += 1) {
             const filePath = files[idx];
             const filename = path.basename(filePath);
-            console.log(`\n[${idx + 1}/${total}] 正在上传: ${filename}`);
+            this.log(`\n[${idx + 1}/${total}] 正在上传: ${filename}`);
 
             const result = await this.uploadFile(filePath, topicId);
             results.push(result);
 
             if (result.success) {
                 successCount += 1;
-                console.log(`✓ 上传成功 (doc_id: ${result.doc_id})`);
+                this.log(`✓ 上传成功 (doc_id: ${result.doc_id})`);
             } else {
                 failedCount += 1;
-                console.log(`✗ 上传失败: ${result.error}`);
+                this.log(`✗ 上传失败: ${result.error}`);
             }
 
             // 显示进度
             const progress = ((idx + 1) / total) * 100;
-            console.log(`进度: ${progress.toFixed(1)}% | 成功: ${successCount} | 失败: ${failedCount}`);
+            this.log(`进度: ${progress.toFixed(1)}% | 成功: ${successCount} | 失败: ${failedCount}`);
         }
 
-        console.log('\n上传完成！');
-        console.log(`总计: ${total} 个文件`);
-        console.log(`成功: ${successCount} 个文件`);
-        console.log(`失败: ${failedCount} 个文件`);
+        this.log('\n上传完成！');
+        this.log(`总计: ${total} 个文件`);
+        this.log(`成功: ${successCount} 个文件`);
+        this.log(`失败: ${failedCount} 个文件`);
 
         return {
             total,
@@ -321,6 +344,40 @@ class DocchainUploader {
             results,
         };
     }
+}
+
+/**
+ * 上传单个文件或整个文件夹（仅顶层）。
+ * CLI 与宿主工具共用这一条路径。
+ * @param {object} config - { docchain_url, docchain_api_key }
+ * @param {object} params - { target, topicId, mode: 'file'|'folder', quiet }
+ * @returns {Promise<object>} 结构化 payload
+ */
+async function runUpload(config, { target, topicId, mode = 'file', quiet = true } = {}) {
+    if (!topicId || !Number.isInteger(topicId) || topicId <= 0) {
+        throw new DocchainError('CONFIG', 'topic_id 必填，且必须是正整数');
+    }
+    if (!target) throw new DocchainError('CONFIG', 'target 必填：要上传的文件或文件夹路径');
+
+    const uploader = new DocchainUploader(config, quiet);
+
+    if (mode === 'folder') {
+        const files = uploader.scanFiles(target);
+        if (files.length === 0) {
+            throw new DocchainError('NO_RESULTS', `文件夹内没有可上传的文件：${target}`);
+        }
+        const summary = await uploader.batchUpload(files, topicId);
+        return Object.assign({ ok: summary.failed === 0, mode: 'batch' }, summary);
+    }
+
+    const result = await uploader.uploadFile(target, topicId);
+    if (!result.success) {
+        // A missing local file is NOT_FOUND, not a server failure: the caller
+        // must be able to tell "wrong path" apart from "the service rejected it".
+        const missing = /不存在/.test(result.error || '');
+        throw new DocchainError(missing ? 'NOT_FOUND' : 'SERVER_ERROR', `上传失败：${result.error}`);
+    }
+    return { ok: true, mode: 'single', doc_id: result.doc_id, doc_name: result.doc_name, topic_id: result.topic_id, file: result.file };
 }
 
 async function main() {
@@ -358,32 +415,44 @@ async function main() {
     const uploader = new DocchainUploader();
 
     // 执行命令
-    if (command === 'upload-file') {
-        const result = await uploader.uploadFile(targetPath, topicId);
-        console.log(JSON.stringify(Object.assign({ ok: result.success === true }, result)));
-    } else if (command === 'upload-folder') {
-        const files = uploader.scanFiles(targetPath);
+    try {
+        if (command === 'upload-file') {
+            const result = await uploader.uploadFile(targetPath, topicId);
+            console.log(JSON.stringify(Object.assign({ ok: result.success === true }, result)));
+        } else if (command === 'upload-folder') {
+            const files = uploader.scanFiles(targetPath);
 
-        if (files.length === 0) {
-            printError('NO_RESULTS', '未找到匹配的文件');
-        }
+            if (files.length === 0) {
+                printError('NO_RESULTS', '未找到匹配的文件');
+            }
 
-        console.log(`\n找到 ${files.length} 个文件:`);
-        for (const f of files.slice(0, 10)) {
-            console.log(`  - ${path.basename(f)}`);
-        }
-        if (files.length > 10) {
-            console.log(`  ... 还有 ${files.length - 10} 个文件`);
-        }
+            console.log(`\n找到 ${files.length} 个文件:`);
+            for (const f of files.slice(0, 10)) {
+                console.log(`  - ${path.basename(f)}`);
+            }
+            if (files.length > 10) {
+                console.log(`  ... 还有 ${files.length - 10} 个文件`);
+            }
 
-        const summary = await uploader.batchUpload(files, topicId);
-        console.log(JSON.stringify(Object.assign({ ok: summary.failed === 0, mode: 'batch' }, summary)));
-    } else {
-        console.log(USAGE);
-        process.exit(1);
+            const summary = await uploader.batchUpload(files, topicId);
+            console.log(JSON.stringify(Object.assign({ ok: summary.failed === 0, mode: 'batch' }, summary)));
+        } else {
+            console.log(USAGE);
+            process.exit(1);
+        }
+    } catch (error) {
+        printError(error.code || 'SERVER_ERROR', error.message);
     }
 }
 
 if (require.main === module) {
     main();
 }
+
+// The host half calls these directly (in-process tool execution).
+module.exports = {
+    DocchainUploader,
+    runUpload,
+    getConfig,
+    DocchainError,
+};

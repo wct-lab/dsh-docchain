@@ -523,7 +523,7 @@ class Doc2Markdown {
             const result = await this.checkStatus(docId);
             if (result === null) {
                 console.log("错误：无法获取文档状态，请稍后重试");
-                failJson('SERVER_ERROR', '无法获取文档状态，请稍后重试');
+                throw new DocchainError('SERVER_ERROR', '无法获取文档状态，请稍后重试');
             }
             if (result.status === 'done') {
                 console.log(`  转换完成，正在下载...`);
@@ -574,7 +574,7 @@ class Doc2Markdown {
         const docId = await this.uploadFile(filePath);
         if (!docId) {
             console.log(`文件上传失败！`);
-            failJson('SERVER_ERROR', `文件上传失败：${filePath}`);
+            throw new DocchainError('SERVER_ERROR', `文件上传失败：${filePath}`);
         }
         console.log(`  上传成功，文档 ID：${docId}`);
 
@@ -584,9 +584,10 @@ class Doc2Markdown {
 
         if (result === true) {
             console.log(`[3/3] 下载完成，文件已保存：${detail}`);
+            return { ok: true, mode: 'convert', doc_id: docId, saved_path: detail };
         } else if (result === false) {
             console.log(`错误：${detail}`);
-            failJson('SERVER_ERROR', `转换失败：${detail}`);
+            throw new DocchainError('SERVER_ERROR', `转换失败：${detail}`);
         } else {
             console.log(`  文档 ID：${docId}`);
             console.log(`[!] 文档仍在转换中（已超过 ${POLL_TIMEOUT}s）`);
@@ -596,7 +597,14 @@ class Doc2Markdown {
                 console.log(`[!] 大文档通常需要更长时间；高峰时段转换可能排队，请耐心等待`);
                 console.log(`[!] 是否继续查询转换状态并下载`);
             }
-            process.exit(2);
+            // 仍在转换中不是失败：如实返回 pending，让调用方用 check 继续。
+            return {
+                ok: false,
+                error: 'PENDING',
+                message: `文档仍在转换中（已超过 ${POLL_TIMEOUT}s），稍后用 action="check" 带上 doc_id 继续。`,
+                doc_id: docId,
+                pending: true,
+            };
         }
     }
 
@@ -704,50 +712,59 @@ class Doc2Markdown {
         const result = await this.checkStatus(docId);
         if (result === null) {
             console.log("Error: Unable to get document status, please retry later");
-            failJson('SERVER_ERROR', '无法获取文档状态，请稍后重试');
+            throw new DocchainError('SERVER_ERROR', '无法获取文档状态，请稍后重试');
         }
 
         if (result.status === 'failed') {
             const reason = result.error ? `：${result.error}` : '';
             console.log(`错误：文档转换失败${reason}`);
-            failJson('SERVER_ERROR', `文档转换失败${reason}`);
+            throw new DocchainError('SERVER_ERROR', `文档转换失败${reason}`);
         } else if (result.status === 'done') {
             console.log(`  转换已完成，正在下载...`);
             if (mdOnly) {
                 const markdownBytes = await this.getMarkdownFile(docId);
                 if (!markdownBytes) {
                     console.log("获取 Markdown 内容失败");
-                    failJson('SERVER_ERROR', '获取 Markdown 内容失败');
+                    throw new DocchainError('SERVER_ERROR', '获取 Markdown 内容失败');
                 }
                 const outFilePath = await this.saveMarkdownFile(markdownBytes, filePath);
                 if (!outFilePath) {
-                    failJson('SERVER_ERROR', '保存 Markdown 文件失败');
+                    throw new DocchainError('SERVER_ERROR', '保存 Markdown 文件失败');
                 }
                 console.log(`[2/2] 下载完成，文件已保存：${outFilePath}`);
+                return { ok: true, mode: 'check', doc_id: docId, saved_path: outFilePath };
             } else {
                 const zipBytes = await this.getMarkdown(docId);
                 if (!zipBytes) {
                     console.log("获取 Markdown 内容失败");
-                    failJson('SERVER_ERROR', '获取 Markdown 内容失败');
+                    throw new DocchainError('SERVER_ERROR', '获取 Markdown 内容失败');
                 }
                 const outDir = await this.saveMarkdown(zipBytes, docId, filePath);
                 if (!outDir) {
-                    failJson('SERVER_ERROR', '保存 Markdown 包失败');
+                    throw new DocchainError('SERVER_ERROR', '保存 Markdown 包失败');
                 }
                 console.log(`[2/2] 下载完成，文件已保存：${outDir}`);
+                return { ok: true, mode: 'check', doc_id: docId, saved_path: outDir };
             }
         } else {
             console.log("  文档仍在转换中，继续等待...");
             const [result, detail] = await this.pollUntilDone(docId, filePath, mdOnly);
             if (result === true) {
                 console.log(`[2/2] 下载完成，文件已保存：${detail}`);
+                return { ok: true, mode: 'check', doc_id: docId, saved_path: detail };
             } else if (result === false) {
                 console.log(`错误：${detail}`);
-                failJson('SERVER_ERROR', `转换失败：${detail}`);
+                throw new DocchainError('SERVER_ERROR', `转换失败：${detail}`);
             } else {
                 console.log(`[!] 文档仍在转换中，请稍后重试`);
                 console.log(`  文档 ID：${docId}`);
-                process.exit(2);
+                return {
+                    ok: false,
+                    error: 'PENDING',
+                    message: '文档仍在转换中，请稍后用同一个 doc_id 再查一次。',
+                    doc_id: docId,
+                    pending: true,
+                };
             }
         }
     }
@@ -766,6 +783,19 @@ const USAGE = `用法：
   node doc2markdown.js check 123-f3ce07 report.pdf --md`;
 
 /**
+ * A business failure carrying the same error vocabulary as the tool layer.
+ * The compute path throws this instead of printing and exiting, so the same
+ * class serves both the CLI and the in-process tool registration.
+ */
+class DocchainError extends Error {
+    constructor(code, message) {
+        super(message);
+        this.name = 'DocchainError';
+        this.code = code;
+    }
+}
+
+/**
  * Print a structured failure envelope `{ok:false, error, message}` on stdout
  * and exit. doc2markdown is an interactive pipeline, so any human-readable
  * progress/error line is printed beforehand by the caller; this only appends
@@ -779,13 +809,44 @@ function failJson(error, message) {
 }
 
 
+/**
+ * CLI / 工具共用的入口：convert（上传+轮询+下载）或 check（按 doc_id 查状态并下载）。
+ * 本类自行解析服务地址与 API Key（与其他脚本的配置链不同），因此不需要外部 config。
+ * @param {object} params - { action: 'convert'|'check', file_path, doc_id, md_only }
+ * @returns {Promise<object>} 结构化 payload
+ */
+async function runDoc2Markdown(params = {}) {
+    const converter = new Doc2Markdown();
+    const mdOnly = Boolean(params.md_only);
+    const action = params.action === 'check' ? 'check' : 'convert';
+
+    if (action === 'check') {
+        if (!params.doc_id) throw new DocchainError('CONFIG', 'check 需要 doc_id');
+        if (!params.file_path) throw new DocchainError('CONFIG', 'check 需要 file_path（决定保存位置与命名）');
+        return converter.checkAndDownload(String(params.doc_id), params.file_path, mdOnly);
+    }
+
+    if (!params.file_path) throw new DocchainError('CONFIG', 'convert 需要 file_path');
+    return converter.convertFile(params.file_path, mdOnly);
+}
+
+/** CLI 出口：把 pending 结果按原来的 exit 2 语义呈现。 */
+function emitCliResult(result) {
+    if (result && result.pending) {
+        console.log(JSON.stringify({ ok: false, error: 'PENDING', message: result.message, doc_id: result.doc_id }));
+        process.exit(2);
+    }
+    if (result && result.ok) {
+        console.log(JSON.stringify(result));
+    }
+}
+
 async function main() {
     if (process.argv.length < 3) {
         console.log(USAGE);
         failJson('CONFIG', '缺少命令参数');
     }
 
-    const converter = new Doc2Markdown();
     const cmd = process.argv[2];
 
     // Parse --md flag
@@ -796,21 +857,24 @@ async function main() {
             console.log("用法：node doc2markdown.js convert <file_path> [--md]");
             failJson('CONFIG', 'convert 需要 <file_path> 参数');
         }
-        await converter.convertFile(process.argv[3], mdOnly);
+        emitCliResult(await runDoc2Markdown({ action: 'convert', file_path: process.argv[3], md_only: mdOnly }));
 
     } else if (cmd === "check") {
         if (process.argv.length < 5 || process.argv.length > 6) {
             console.log("用法：node doc2markdown.js check <doc_id> <file_path> [--md]");
             failJson('CONFIG', 'check 需要 <doc_id> 与 <file_path> 参数');
         }
-        const docId = process.argv[3];
-        const filePath = process.argv[4];
-        await converter.checkAndDownload(docId, filePath, mdOnly);
+        emitCliResult(await runDoc2Markdown({
+            action: 'check',
+            doc_id: process.argv[3],
+            file_path: process.argv[4],
+            md_only: mdOnly,
+        }));
 
     } else {
         // Backward compatibility: treat direct file path as convert
         if (fs.existsSync(cmd) && fs.statSync(cmd).isFile()) {
-            await converter.convertFile(cmd, mdOnly);
+            emitCliResult(await runDoc2Markdown({ action: 'convert', file_path: cmd, md_only: mdOnly }));
         } else {
             console.log(`未知命令：${cmd}`);
             console.log(USAGE);
@@ -822,11 +886,14 @@ async function main() {
 if (require.main === module) {
     main().catch(error => {
         console.error(`程序执行错误：${error.message}`);
-        failJson('SERVER_ERROR', `程序执行错误：${error.message}`);
+        failJson(error.code || 'SERVER_ERROR', `程序执行错误：${error.message}`);
     });
 }
 
 module.exports = Doc2Markdown;
+module.exports.Doc2Markdown = Doc2Markdown;
+module.exports.runDoc2Markdown = runDoc2Markdown;
+module.exports.DocchainError = DocchainError;
 // Expose the pure resolvers for tests without changing the existing export shape
 module.exports.resolveApiKey = resolveApiKey;
 module.exports.resolveBaseUrl = resolveBaseUrl;

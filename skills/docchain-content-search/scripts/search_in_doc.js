@@ -57,6 +57,19 @@ class HttpError extends Error {
 }
 
 /**
+ * A business failure carrying the same error vocabulary as the tool layer.
+ * Pure functions throw this instead of printing and exiting, so the same code
+ * serves both the CLI and the in-process tool registration.
+ */
+class DocchainError extends Error {
+    constructor(code, message) {
+        super(message);
+        this.name = 'DocchainError';
+        this.code = code;
+    }
+}
+
+/**
  * Send a JSON HTTP request and parse the JSON response body.
  * Non-2xx status codes reject with an HttpError.
  * @param {string} url
@@ -276,6 +289,9 @@ function printError(error, message) {
  * @param {object} [statusMessages] - HTTP status code to friendly message
  */
 function failWith(error, statusMessages = {}) {
+    if (error instanceof DocchainError) {
+        printError(error.code, error.message);
+    }
     if (error instanceof HttpError) {
         if (error.status === 401 || error.status === 403) {
             printError('NO_PERMISSION', statusMessages[error.status] || '无权限访问文档或主题');
@@ -298,9 +314,7 @@ function failWith(error, statusMessages = {}) {
  * @param {number} params.limit - 返回结果的最大数量
  * @returns {Promise<object>} API 响应
  */
-async function searchInDoc({ docIds, topicIds, keywords, operator, limit }) {
-    const config = getConfig();
-
+async function searchInDoc(config, { docIds, topicIds, keywords, operator, limit }) {
     const apiUrl = config.docchain_url.replace(/\/+$/, '');
     const endpoint = `${apiUrl}/v1/skills/search_in_doc_content`;
 
@@ -393,6 +407,22 @@ function buildPayload(data) {
     };
 }
 
+/**
+ * 完整的内容搜索：调用接口 → 归一化 → 空结果抛错。
+ * CLI 与宿主工具共用这一条路径，保证两边行为一致。
+ * @param {object} config - { docchain_url, docchain_api_key }
+ * @param {object} params - { docIds, topicIds, keywords, operator, limit }
+ * @returns {Promise<object>} 结构化 payload
+ */
+async function runContentSearch(config, params) {
+    const data = await searchInDoc(config, params);
+    const payload = buildPayload(data);
+    if (!payload.total) {
+        throw new DocchainError('NO_RESULTS', `未找到包含关键词 ${JSON.stringify(payload.keywords)} 的内容`);
+    }
+    return payload;
+}
+
 async function main() {
     const args = parseArgs(process.argv.slice(2), ARG_SPEC);
 
@@ -413,18 +443,28 @@ async function main() {
     }
 
     try {
-        // 执行搜索
-        const results = await searchInDoc({
+        const config = getConfig();
+        const data = await searchInDoc(config, {
             docIds,
             topicIds,
             keywords,
             operator: args.operator,
             limit: args.limit,
         });
+        const payload = buildPayload(data);
 
         // 显示结果
-        console.log(formatResults(results));
-        console.log(JSON.stringify(buildPayload(results)));
+        console.log(formatResults(data));
+        if (!payload.total) {
+            // 空结果：与工具层一致地给出 NO_RESULTS，但不当作硬失败（exit 0）。
+            console.log(JSON.stringify({
+                ok: false,
+                error: 'NO_RESULTS',
+                message: `未找到包含关键词 ${JSON.stringify(payload.keywords)} 的内容`,
+            }));
+            return;
+        }
+        console.log(JSON.stringify(payload));
     } catch (error) {
         failWith(error, { 403: '无权限访问文档', 404: '文档不存在' });
     }
@@ -433,3 +473,14 @@ async function main() {
 if (require.main === module) {
     main();
 }
+
+// The host half calls these directly (in-process tool execution).
+module.exports = {
+    searchInDoc,
+    buildPayload,
+    formatResults,
+    runContentSearch,
+    getConfig,
+    HttpError,
+    DocchainError,
+};

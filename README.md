@@ -6,17 +6,30 @@ A DSH knowledge base and document conversion plugin bundling filename/content/me
 
 Its configuration page goes beyond a single endpoint: it keeps a list of **saved environments** — each with its own address and its own credential — switches between them in one click, and pre-selects **topics** per environment, so a later request can say "search this topic" without naming an id.
 
+Apart from `deep-research-advanced` (a pure instruction workflow with no script), every capability is also exposed as a **native tool**, executed in-process by the host instead of by shelling out to a script:
+
+| Tool | What it does |
+|---|---|
+| `docchain_doc_search` | Locate documents by doc_id / document-name keyword, list details, optionally read content (paged, resumable) |
+| `docchain_content_search` | Search document content by keyword; returns matching line numbers and content |
+| `docchain_filename_search` | Find documents whose filename matches keywords, within the given topics |
+| `docchain_topic_info` | List topics with pagination and a name-or-id keyword filter |
+| `docchain_meta_search` | Filter documents by custom metadata fields (string/number/time, AND / OR groups) |
+| `docchain_upload` | Upload a file, or a folder's top-level files, to a topic |
+| `docchain_image_search` | Image-to-image search with a local picture |
+| `doc2markdown` | Convert docx/doc/pdf/pptx/xlsx/images and more to Markdown |
+
 | Skill | Kind | Description |
 |---|---|---|
-| `docchain-filename-search` | SKILL.md + Node.js script | Find documents whose filename matches keywords, within the given topics |
-| `docchain-doc-search` | SKILL.md + Node.js script | Locate documents by doc_id or document-name keyword, show their details, and optionally read a document's content (paged, resumable) |
-| `docchain-content-search` | SKILL.md + Node.js script | Search document content by keyword; returns line numbers and content; `or`/`and` operators |
-| `docchain-meta-search` | SKILL.md + Node.js script | Query documents by custom metadata fields (string/number/time, exact and range) |
-| `docchain-topic-info` | SKILL.md + Node.js script | List docchain topics with pagination and a name-or-id keyword filter |
-| `docchain-upload` | SKILL.md + Node.js script | Upload a local file or a whole folder to a given docchain topic in bulk |
-| `doc2markdown` | SKILL.md + Node.js script | Convert docx/doc/pdf/pptx/xlsx/images and many more formats to Markdown via the docchain parsing service; results land next to the source file |
-| `docchain-image-search` | SKILL.md + Node.js script | Find similar images by example: upload one picture, get back matching images with their topic, document and similarity score |
-| `deep-research-advanced` | SKILL.md only | Orchestrator-style multi-subagent deep research workflow (pure instructions, no scripts) |
+| `docchain-filename-search` | SKILL.md + Node.js script | Find documents whose filename matches keywords, within the given topics (tool: `docchain_filename_search`) |
+| `docchain-doc-search` | SKILL.md + Node.js script | Locate documents by doc_id or document-name keyword, show their details, and optionally read a document's content (paged, resumable; tool: `docchain_doc_search`) |
+| `docchain-content-search` | SKILL.md + Node.js script | Search document content by keyword; returns line numbers and content; `or`/`and` operators (tool: `docchain_content_search`) |
+| `docchain-meta-search` | SKILL.md + Node.js script | Query documents by custom metadata fields (string/number/time, exact and range; tool: `docchain_meta_search`) |
+| `docchain-topic-info` | SKILL.md + Node.js script | List docchain topics with pagination and a name-or-id keyword filter (tool: `docchain_topic_info`) |
+| `docchain-upload` | SKILL.md + Node.js script | Upload a local file or a whole folder to a given docchain topic in bulk (tool: `docchain_upload`) |
+| `doc2markdown` | SKILL.md + Node.js script | Convert docx/doc/pdf/pptx/xlsx/images and many more formats to Markdown via the docchain parsing service (tool: `doc2markdown`) |
+| `docchain-image-search` | SKILL.md + Node.js script | Find similar images by example (tool: `docchain_image_search`) |
+| `deep-research-advanced` | SKILL.md only | Orchestrator-style multi-subagent deep research workflow (pure instructions, no scripts, no tool) |
 
 ## Installation
 
@@ -131,6 +144,27 @@ The bundle inserts one Host plugin (`dsh-docchain`). At activation it registers 
 - The provider rank is **450** — project roots (`.dsh/skills` = 100, project `.agents/skills` = 200), runtime registrations (250) and `customSkillDirs` (300) keep precedence, as does `~/.dsh/skills` (400); the bundle outranks `~/.agents/skills` (500) and the bundled root (600). In practice: same-name copies in `~/.agents/skills` are shadowed by this bundle; delete them there if you want a single source.
 - Two optional services carry the configuration page: the host registers `GET /plugin/dsh-docchain/topics` on the web server (the browser never holds the API key, so the host queries the active environment on its behalf), and a prompt section that describes the active environment and its selected topics. A profile without those services still gets the skill provider and the projection file.
 - Neither the topic route nor the prompt section caches state of its own: both read the live row config on every call, so switching an environment or a topic reaches the scripts and the next model step without a restart.
+
+## Native tools
+
+Every script-backed capability is registered as a DSH tool, so the model calls it directly and the host executes it in-process — no shell step.
+
+| Tool | Key arguments |
+|---|---|
+| `docchain_doc_search` | `doc_ids` or `keyword` (exactly one); `content: true` reads content (single id only); `offset` / `max_lines` page through it |
+| `docchain_content_search` | `keywords` required; at least one of `doc_ids` / `topic_ids`; `operator` is `or` or `and` |
+| `docchain_filename_search` | `keywords` and `topic_ids` both required (filename search inside those topics only) |
+| `docchain_topic_info` | `page` / `size` / `keyword`, all optional |
+| `docchain_meta_search` | `conditions` as `[{field, op, value}]` (AND), `or_groups` (OR inside, AND across); `list_fields: true` lists fields |
+| `docchain_upload` | `path` + `topic_id` required; `mode` is `file` or `folder` (top level only) |
+| `docchain_image_search` | `image` required; omitted `topic_ids` falls back to the page's selected topics; `all` scans everything |
+| `doc2markdown` | `file_path` required; `action` is `convert` or `check`; `md_only` exports a single md |
+
+Tools and scripts share **one implementation**: the host requires the script modules and calls their exported compute functions, so a tool result cannot drift from a `node scripts/...` run. Registration goes through `ctx.inject(["tools"])`, so a host without the tool registry keeps the skills, the projection file and the configuration page — it just has no tools.
+
+Failures return `{ ok: false, error, message }` with the same `error` values as the scripts: `CONFIG` / `NO_RESULTS` / `NOT_FOUND` / `NO_PERMISSION` / `SERVER_ERROR`. `doc2markdown` adds `PENDING` for "still converting, call `check` later". Arguments are arrays or objects (`doc_ids: [1, 2]`), never comma-joined strings.
+
+`docchain_upload` and the `convert` action of `doc2markdown` are marked non-concurrency-safe (one writes to the knowledge base, the other is a long pipeline); the search tools may run in parallel.
 
 ## Skills
 

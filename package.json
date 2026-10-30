@@ -1,9 +1,9 @@
 {
   "name": "dsh-docchain",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "private": true,
   "type": "module",
-  "description": "DSH knowledge base and document conversion plugin: filename/content/metadata search, locate-by-doc_id/name with content reading, topic listing, bulk document upload, document-to-Markdown conversion, image-similarity search, plus a deep-research workflow; the configuration page keeps switchable docchain environments with per-environment topic selection",
+  "description": "DSH knowledge base and document conversion plugin: filename/content/metadata search, locate-by-doc_id/name with content reading, topic listing, bulk document upload, document-to-Markdown conversion, image-similarity search, plus a deep-research workflow. Every script-backed capability also ships as a native tool executed in-process; the configuration page keeps switchable docchain environments with per-environment topic selection",
   "icon": "assets/icon.png",
   "license": "MIT",
   "repository": {

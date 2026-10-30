@@ -55,6 +55,19 @@ class HttpError extends Error {
 }
 
 /**
+ * A business failure carrying the same error vocabulary as the tool layer.
+ * Pure functions throw this instead of printing and exiting, so the same code
+ * serves both the CLI and the in-process tool registration.
+ */
+class DocchainError extends Error {
+    constructor(code, message) {
+        super(message);
+        this.name = 'DocchainError';
+        this.code = code;
+    }
+}
+
+/**
  * Send a JSON HTTP request and parse the JSON response body.
  * Non-2xx status codes reject with an HttpError.
  * @param {string} url
@@ -250,8 +263,7 @@ function printError(error, message) {
  * @param {string|null} [keyword=null] - 主题名称关键字过滤，为空时不传该参数
  * @returns {Promise<object>} 包含主题列表的 JSON 对象
  */
-async function listTopics(page = 1, size = 20, keyword = null) {
-    const config = getConfig();
+async function listTopics(config, page = 1, size = 20, keyword = null) {
     const url = `${config.docchain_url.replace(/\/+$/, '')}/v1/topic/list_by_pagination`;
     const params = new URLSearchParams({ page: String(page), size: String(size) });
     if (keyword && String(keyword).trim()) {
@@ -265,7 +277,7 @@ async function listTopics(page = 1, size = 20, keyword = null) {
         const { data } = await requestJson(endpoint, { method: 'GET', headers });
 
         if (data && data.success === false) {
-            printError('SERVER_ERROR', `查询主题列表失败：${data.err || '未知错误'}`);
+            throw new DocchainError('SERVER_ERROR', `查询主题列表失败：${data.err || '未知错误'}`);
         }
 
         // API 返回结构是 {"success":true,"data":{"total":X,"data":[...]}}
@@ -279,18 +291,19 @@ async function listTopics(page = 1, size = 20, keyword = null) {
                 data: result.data || [],
             };
         }
-        return result;
+        return result || { total: 0, page, size, data: [] };
     } catch (error) {
+        if (error instanceof DocchainError) throw error;
         if (error instanceof HttpError) {
             if (error.status === 401 || error.status === 403) {
-                printError('NO_PERMISSION', '无权限访问主题列表（HTTP ' + error.status + '）');
+                throw new DocchainError('NO_PERMISSION', '无权限访问主题列表（HTTP ' + error.status + '）');
             }
             if (error.status >= 500) {
-                printError('SERVER_ERROR', '服务端错误（HTTP ' + error.status + '）');
+                throw new DocchainError('SERVER_ERROR', '服务端错误（HTTP ' + error.status + '）');
             }
-            printError('SERVER_ERROR', 'API 请求失败：HTTP ' + error.status);
+            throw new DocchainError('SERVER_ERROR', 'API 请求失败：HTTP ' + error.status);
         }
-        printError('SERVER_ERROR', `查询主题列表失败：${error.message}`);
+        throw new DocchainError('SERVER_ERROR', `查询主题列表失败：${error.message}`);
     }
 }
 
@@ -325,16 +338,44 @@ function formatResults(data) {
     return { total, page, size, pages, topics: topicList };
 }
 
+/**
+ * 完整主题查询：调用接口 → 归一化。
+ * CLI 与宿主工具共用这一条路径。
+ * @param {object} config - { docchain_url, docchain_api_key }
+ * @param {object} params - { page, size, keyword }
+ * @returns {Promise<object>} 结构化 payload
+ */
+async function runTopicInfo(config, { page = 1, size = 20, keyword = null } = {}) {
+    const result = await listTopics(config, page, size, keyword);
+    return Object.assign({ ok: true, mode: 'topics' }, formatResults(result));
+}
+
 async function main() {
     const args = parseArgs(process.argv.slice(2), ARG_SPEC);
 
-    // 查询主题列表
-    const result = await listTopics(args.page, args.size, args.keyword);
-
-    // 直接输出 JSON 格式（统一带 ok:true）
-    console.log(JSON.stringify(Object.assign({ ok: true, mode: 'topics' }, formatResults(result))));
+    try {
+        const payload = await runTopicInfo(getConfig(), {
+            page: args.page,
+            size: args.size,
+            keyword: args.keyword,
+        });
+        // 直接输出 JSON 格式（统一带 ok:true）
+        console.log(JSON.stringify(payload));
+    } catch (error) {
+        printError(error.code || 'SERVER_ERROR', error.message);
+    }
 }
 
 if (require.main === module) {
     main();
 }
+
+// The host half calls these directly (in-process tool execution).
+module.exports = {
+    listTopics,
+    formatResults,
+    runTopicInfo,
+    getConfig,
+    HttpError,
+    DocchainError,
+};
