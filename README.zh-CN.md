@@ -6,17 +6,30 @@
 
 它的配置页不止一个服务地址：可以保存一组**常用环境**（每个环境有自己的地址与凭据）并一键切换，还能按环境预选**主题**，之后直接说"在这个主题里搜"而不必报 id。
 
+除 `deep-research-advanced`（纯指令工作流，无脚本）外，其余能力都以**原生工具**提供，由宿主进程内直接执行（不再经由 shell 跑脚本）：
+
+| 工具 | 说明 |
+|---|---|
+| `docchain_doc_search` | 按 doc_id / 文档名称定位文档，列出详情，可选读取正文（分段续读） |
+| `docchain_content_search` | 在文档正文中按关键词搜索，返回命中行号与内容 |
+| `docchain_filename_search` | 在指定主题内按文件名关键词查找文档 |
+| `docchain_topic_info` | 查询主题列表，支持分页与名称/ID 关键字过滤 |
+| `docchain_meta_search` | 按自定义元数据字段筛选文档（字符串/数值/时间，AND / OR 组） |
+| `docchain_upload` | 把文件或文件夹（仅顶层）批量上传到指定主题 |
+| `docchain_image_search` | 图搜图：用本地图片检索相似图片 |
+| `doc2markdown` | 把 docx/doc/pdf/pptx/xlsx/图片等解析为 Markdown |
+
 | 技能 | 形态 | 说明 |
 |---|---|---|
-| `docchain-filename-search` | SKILL.md + Node.js 脚本 | 在指定主题内按文件名关键词查找文档 |
-| `docchain-doc-search` | SKILL.md + Node.js 脚本 | 按 doc_id 或文档名称关键字定位文档、列出详情，并可读取指定文档正文（分段续读） |
-| `docchain-content-search` | SKILL.md + Node.js 脚本 | 在文档内容中搜索关键词，返回行号和内容，支持"或/且" |
-| `docchain-meta-search` | SKILL.md + Node.js 脚本 | 按自定义元数据字段查询文档（字符串/数值/时间，精确与范围） |
-| `docchain-topic-info` | SKILL.md + Node.js 脚本 | 查询 docchain 主题列表，支持分页与名称/ID 关键字过滤 |
-| `docchain-upload` | SKILL.md + Node.js 脚本 | 把本地文件或整个文件夹批量上传到指定 docchain 主题 |
-| `doc2markdown` | SKILL.md + Node.js 脚本 | 把 docx/doc/pdf/pptx/xlsx/图片等常见格式解析为 Markdown，结果保存在源文件同目录 |
-| `docchain-image-search` | SKILL.md + Node.js 脚本 | 图搜图：给一张图，找库里相似的图片，并返回所属主题、文档名与相似度 |
-| `deep-research-advanced` | 仅 SKILL.md | 主控式多子智能体深度研究工作流（纯指令，无脚本） |
+| `docchain-filename-search` | SKILL.md + Node.js 脚本 | 在指定主题内按文件名关键词查找文档（工具 `docchain_filename_search`） |
+| `docchain-doc-search` | SKILL.md + Node.js 脚本 | 按 doc_id 或文档名称关键字定位文档、列出详情，并可读取指定文档正文（分段续读；工具 `docchain_doc_search`） |
+| `docchain-content-search` | SKILL.md + Node.js 脚本 | 在文档内容中搜索关键词，返回行号和内容，支持"或/且"（工具 `docchain_content_search`） |
+| `docchain-meta-search` | SKILL.md + Node.js 脚本 | 按自定义元数据字段查询文档（字符串/数值/时间，精确与范围；工具 `docchain_meta_search`） |
+| `docchain-topic-info` | SKILL.md + Node.js 脚本 | 查询 docchain 主题列表，支持分页与名称/ID 关键字过滤（工具 `docchain_topic_info`） |
+| `docchain-upload` | SKILL.md + Node.js 脚本 | 把本地文件或整个文件夹批量上传到指定 docchain 主题（工具 `docchain_upload`） |
+| `doc2markdown` | SKILL.md + Node.js 脚本 | 把 docx/doc/pdf/pptx/xlsx/图片等常见格式解析为 Markdown（工具 `doc2markdown`） |
+| `docchain-image-search` | SKILL.md + Node.js 脚本 | 图搜图：给一张图，找库里相似的图片（工具 `docchain_image_search`） |
+| `deep-research-advanced` | 仅 SKILL.md | 主控式多子智能体深度研究工作流（纯指令，无脚本、无工具） |
 
 ## 安装
 
@@ -131,6 +144,27 @@ Bundle 插入一个 Host 插件（`dsh-docchain`），激活时在 `ctx.skills` 
 - 提供者 rank 为 **450**：项目根（`.dsh/skills` = 100、项目 `.agents/skills` = 200）、runtime 注册（250）与 `customSkillDirs`（300）优先级更高，`~/.dsh/skills`（400）同样优先；本 Bundle 高于 `~/.agents/skills`（500）与 bundled 根（600）。也就是说：`~/.agents/skills` 里的同名旧副本会被本 Bundle 覆盖；确认无误后可删除旧副本，只保留单一来源。
 - 配置页依赖两个可选服务：宿主在 Web 服务器上注册 `GET /plugin/dsh-docchain/topics`（浏览器拿不到 API Key，由宿主代当前环境查询），以及一段描述「当前环境 + 已选主题」的 prompt section。缺少这两个服务的部署仍然拥有技能提供者与投影文件。
 - 这两者都不缓存业务状态：每次调用都读实时行配置，所以切换环境或主题后，脚本与下一步模型都能立刻看到，无需重启。
+
+## 原生工具
+
+三个核心检索能力同时以 DSH 工具提供，模型直接调用、宿主进程内执行，**不再经由 shell 跑脚本**。
+
+| 工具 | 参数要点 |
+|---|---|
+| `docchain_doc_search` | `doc_ids` 或 `keyword` 二选一；`content: true` 读正文（限 1 个 id）；`offset` / `max_lines` 分段续读 |
+| `docchain_content_search` | `keywords` 必填；`doc_ids` / `topic_ids` 至少一个；`operator` 取 `or`/`and` |
+| `docchain_filename_search` | `keywords` + `topic_ids` 均必填（只在该主题范围内按文件名查） |
+| `docchain_topic_info` | `page` / `size` / `keyword` 都可选 |
+| `docchain_meta_search` | `conditions` 为 `[{field, op, value}]`（AND）、`or_groups` 组内 OR 组间 AND；`list_fields: true` 列字段 |
+| `docchain_upload` | `path` + `topic_id` 必填；`mode` 取 `file`/`folder`（仅顶层） |
+| `docchain_image_search` | `image` 必填；`topic_ids` 省略则用配置页选中主题；`all` 扫全库 |
+| `doc2markdown` | `file_path` 必填；`action` 取 `convert`/`check`；`md_only` 只导出单个 md |
+
+实现上工具与脚本**共用同一份代码**：宿主 `require` 脚本模块后调用其导出的计算函数，所以工具结果与 `node scripts/...` 的输出不会分叉。工具注册走 `ctx.inject(["tools"])`——宿主没有工具服务时，技能、投影文件与配置页照常工作，只是没有这些工具。
+
+工具失败时返回 `{ ok: false, error, message }`，`error` 取值与脚本一致：`CONFIG` / `NO_RESULTS` / `NOT_FOUND` / `NO_PERMISSION` / `SERVER_ERROR`（`doc2markdown` 另有 `PENDING`，表示仍在转换、用 `check` 继续）。参数一律用数组或对象（`doc_ids: [1, 2]`），不再拼逗号字符串。
+
+`docchain_upload` 与 `doc2markdown` 的 `convert` 标记为**不可并发**（前者写知识库、后者是长流程）；其余检索类工具可并发。
 
 ## 技能详解
 

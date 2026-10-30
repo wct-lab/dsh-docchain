@@ -67,6 +67,19 @@ class HttpError extends Error {
 }
 
 /**
+ * A business failure carrying the same error vocabulary as the tool layer.
+ * Pure functions throw this instead of printing and exiting, so the same code
+ * serves both the CLI and the in-process tool registration.
+ */
+class DocchainError extends Error {
+    constructor(code, message) {
+        super(message);
+        this.name = 'DocchainError';
+        this.code = code;
+    }
+}
+
+/**
  * Send a JSON HTTP request and parse the JSON response body.
  * Non-2xx status codes reject with an HttpError.
  * @param {string} url
@@ -343,6 +356,9 @@ function docName(detail) {
  * @param {Error} error
  */
 function failWith(error) {
+    if (error instanceof DocchainError) {
+        printError(error.code, error.message);
+    }
     if (error instanceof HttpError) {
         const status = error.status;
         if (status === 401 || status === 403) {
@@ -362,6 +378,7 @@ function failWith(error) {
  * @param {string} keyword
  * @param {number[]|null} topicIds
  * @param {number} size
+ * @returns {Promise<object>} structured payload (throws DocchainError on no match)
  */
 async function searchByKeyword(config, keyword, topicIds, size) {
     const url = `${baseUrl(config)}/v1/doc/list?page=1&size=${KEYWORD_SCAN_SIZE}&keyword=${encodeURIComponent(keyword)}`;
@@ -374,44 +391,58 @@ async function searchByKeyword(config, keyword, topicIds, size) {
     const capped = rows.slice(0, Math.min(size, KEYWORD_RESULT_CAP));
 
     if (capped.length === 0) {
-        printError('NO_RESULTS', `未找到文档名称包含「${keyword}」的文档`);
+        throw new DocchainError('NO_RESULTS', `未找到文档名称包含「${keyword}」的文档`);
     }
 
     const topicNameCache = new Map();
-    const lines = [`🔍 按文档名称搜索：${keyword}`, `✅ 找到 ${capped.length} 个文档`];
-    if (rows.length > capped.length) {
-        lines.push(`（匹配 ${rows.length} 个，仅显示前 ${capped.length} 个）`);
-    }
-    lines.push('');
+    const documents = [];
     for (const row of capped) {
         const tid = Number(row.topic_id);
         if (!topicNameCache.has(tid)) {
             topicNameCache.set(tid, await fetchTopicName(config, tid));
         }
-        const tname = topicNameCache.get(tid);
-        const label = tname ? `${tname} (${tid})` : String(tid);
-        lines.push(`📄 文档 ID: ${row.id} | ${row.path || ''}`);
-        lines.push(`   主题: ${label}`);
-        lines.push('');
+        documents.push({
+            doc_id: row.id,
+            name: row.path || '',
+            topic_id: tid,
+            topic_name: topicNameCache.get(tid),
+        });
     }
-    console.log(lines.join('\n').trimEnd());
-    console.log(JSON.stringify({
+    return {
         ok: true,
         mode: 'keyword',
         keyword,
         total: capped.length,
-        documents: capped.map((row) => ({
-            doc_id: row.id,
-            name: row.path || '',
-            topic_id: Number(row.topic_id),
-        })),
-    }));
+        matched: rows.length,
+        documents,
+    };
+}
+
+/**
+ * Human-readable rendering of a keyword payload (CLI only).
+ * @param {object} payload
+ * @returns {string}
+ */
+function formatKeyword(payload) {
+    const lines = [`🔍 按文档名称搜索：${payload.keyword}`, `✅ 找到 ${payload.total} 个文档`];
+    if (payload.matched > payload.total) {
+        lines.push(`（匹配 ${payload.matched} 个，仅显示前 ${payload.total} 个）`);
+    }
+    lines.push('');
+    for (const doc of payload.documents) {
+        const label = doc.topic_name ? `${doc.topic_name} (${doc.topic_id})` : String(doc.topic_id);
+        lines.push(`📄 文档 ID: ${doc.doc_id} | ${doc.name}`);
+        lines.push(`   主题: ${label}`);
+        lines.push('');
+    }
+    return lines.join('\n').trimEnd();
 }
 
 /**
  * Detail mode: resolve one or more doc_ids to their metadata.
  * @param {object} config
  * @param {number[]} docIds
+ * @returns {Promise<object>} structured payload (throws DocchainError when none found)
  */
 async function listDetails(config, docIds) {
     const found = [];
@@ -432,52 +463,56 @@ async function listDetails(config, docIds) {
     }
 
     if (found.length === 0 && missing.length > 0) {
-        printError('NOT_FOUND', `未找到文档：${missing.join(', ')}（doc_id 不存在或无权访问）`);
+        throw new DocchainError('NOT_FOUND', `未找到文档：${missing.join(', ')}（doc_id 不存在或无权访问）`);
     }
 
-    const lines = [`📋 共查询 ${docIds.length} 个文档，成功 ${found.length} 个` +
-        (missing.length ? `，未找到 ${missing.length} 个` : '')];
-    lines.push('');
-    for (const { detail, topicName } of found) {
-        const label = topicName ? `${topicName} (${detail.topic_id})` : String(detail.topic_id);
-        let pages = '';
+    const documents = found.map(({ detail, topicName }) => {
+        let pages = null;
         if (detail.meta_data) {
             try {
                 const meta = JSON.parse(detail.meta_data);
-                if (meta && typeof meta.pages === 'number' && meta.pages > 0) {
-                    pages = String(meta.pages);
-                }
-            } catch (error) { /* ignore malformed meta */ }
+                if (meta && typeof meta.pages === 'number' && meta.pages > 0) pages = meta.pages;
+            } catch (error) { /* malformed meta is not fatal */ }
         }
-        lines.push(`📄 ${docName(detail)}`);
-        lines.push(`   ID: ${detail.id} | 主题: ${label}`);
-        const sizeInfo = typeof detail.file_size === 'number'
-            ? detail.file_size.toLocaleString('en-US')
-            : String(detail.file_size || '');
-        const bits = [];
-        if (pages) bits.push(`页数: ${pages}`);
-        if (sizeInfo) bits.push(`大小: ${sizeInfo} B`);
-        if (detail.state) bits.push(`状态: ${detail.state}`);
-        if (bits.length) lines.push('   ' + bits.join(' | '));
-        lines.push('');
-    }
-    for (const docId of missing) {
-        lines.push(`⚠️ 文档 ${docId}：未找到（doc_id 不存在或无权访问）`);
-    }
-    console.log(lines.join('\n').trimEnd());
-    console.log(JSON.stringify({
-        ok: true,
-        mode: 'detail',
-        documents: found.map(({ detail, topicName }) => ({
+        return {
             doc_id: detail.id,
             name: docName(detail),
             topic_id: Number(detail.topic_id),
             topic_name: topicName,
+            pages,
             file_size: detail.file_size,
             state: detail.state,
-        })),
-        missing,
-    }));
+        };
+    });
+
+    return { ok: true, mode: 'detail', documents, missing };
+}
+
+/**
+ * Human-readable rendering of a detail payload (CLI only).
+ * @param {object} payload
+ * @returns {string}
+ */
+function formatDetail(payload) {
+    const total = payload.documents.length + payload.missing.length;
+    const lines = [`📋 共查询 ${total} 个文档，成功 ${payload.documents.length} 个` +
+        (payload.missing.length ? `，未找到 ${payload.missing.length} 个` : '')];
+    lines.push('');
+    for (const doc of payload.documents) {
+        const label = doc.topic_name ? `${doc.topic_name} (${doc.topic_id})` : String(doc.topic_id);
+        lines.push(`📄 ${doc.name}`);
+        lines.push(`   ID: ${doc.doc_id} | 主题: ${label}`);
+        const bits = [];
+        if (doc.pages) bits.push(`页数: ${doc.pages}`);
+        if (typeof doc.file_size === 'number') bits.push(`大小: ${doc.file_size.toLocaleString('en-US')} B`);
+        if (doc.state) bits.push(`状态: ${doc.state}`);
+        if (bits.length) lines.push('   ' + bits.join(' | '));
+        lines.push('');
+    }
+    for (const docId of payload.missing) {
+        lines.push(`⚠️ 文档 ${docId}：未找到（doc_id 不存在或无权访问）`);
+    }
+    return lines.join('\n').trimEnd();
 }
 
 /**
@@ -486,11 +521,12 @@ async function listDetails(config, docIds) {
  * @param {number} docId
  * @param {number} offset
  * @param {number} maxLines
+ * @returns {Promise<object>} structured payload including the text chunk
  */
 async function readContent(config, docId, offset, maxLines) {
     const detail = await fetchDetail(config, docId);
     if (!detail) {
-        printError('NOT_FOUND', `未找到文档 ${docId}（doc_id 不存在或无权访问）`);
+        throw new DocchainError('NOT_FOUND', `未找到文档 ${docId}（doc_id 不存在或无权访问）`);
     }
 
     let text;
@@ -498,7 +534,7 @@ async function readContent(config, docId, offset, maxLines) {
         text = await fetchMarkdown(config, docId);
     } catch (error) {
         if (error instanceof HttpError && error.status >= 500) {
-            printError('NOT_FOUND', `文档 ${docId} 无法读取正文（可能是空文档或未转换）`);
+            throw new DocchainError('NOT_FOUND', `文档 ${docId} 无法读取正文（可能是空文档或未转换）`);
         }
         throw error;
     }
@@ -510,12 +546,8 @@ async function readContent(config, docId, offset, maxLines) {
     const chunk = allLines.slice(start, end);
     const nextOffset = end < totalLines ? end : null;
     const topicName = await fetchTopicName(config, detail.topic_id);
-    const label = topicName ? `${topicName} (${detail.topic_id})` : String(detail.topic_id);
 
-    const header = `📖 ${docName(detail)}（ID: ${docId}，主题: ${label}）`;
-    const range = `第 ${start + 1}–${end} 行 / 共 ${totalLines} 行` + (nextOffset !== null ? `（还有内容，next_offset=${nextOffset}）` : '（已到末尾）');
-    console.log([header, range, '', chunk.join('\n')].join('\n'));
-    console.log(JSON.stringify({
+    return {
         ok: true,
         mode: 'content',
         doc_id: detail.id,
@@ -528,7 +560,22 @@ async function readContent(config, docId, offset, maxLines) {
         returned_lines: chunk.length,
         truncated: nextOffset !== null,
         next_offset: nextOffset,
-    }));
+        text: chunk.join('\n'),
+    };
+}
+
+/**
+ * Human-readable rendering of a content payload (CLI only).
+ * @param {object} payload
+ * @returns {string}
+ */
+function formatContent(payload) {
+    const label = payload.topic_name ? `${payload.topic_name} (${payload.topic_id})` : String(payload.topic_id);
+    const header = `📖 ${payload.name}（ID: ${payload.doc_id}，主题: ${label}）`;
+    const lastLine = payload.offset + payload.returned_lines;
+    const range = `第 ${payload.offset + 1}–${lastLine} 行 / 共 ${payload.total_lines} 行` +
+        (payload.next_offset !== null ? `（还有内容，next_offset=${payload.next_offset}）` : '（已到末尾）');
+    return [header, range, '', payload.text].join('\n');
 }
 
 async function main() {
@@ -560,14 +607,20 @@ async function main() {
 
     try {
         if (args.content) {
-            await readContent(config, docIds[0], offset, maxLines);
+            const payload = await readContent(config, docIds[0], offset, maxLines);
+            console.log(formatContent(payload));
+            console.log(JSON.stringify(payload));
             return;
         }
         if (hasKeyword) {
-            await searchByKeyword(config, String(args.keyword).trim(), topicIds, args.size);
+            const payload = await searchByKeyword(config, String(args.keyword).trim(), topicIds, args.size);
+            console.log(formatKeyword(payload));
+            console.log(JSON.stringify(payload));
             return;
         }
-        await listDetails(config, docIds);
+        const payload = await listDetails(config, docIds);
+        console.log(formatDetail(payload));
+        console.log(JSON.stringify(payload));
     } catch (error) {
         failWith(error);
     }
@@ -576,3 +629,19 @@ async function main() {
 if (require.main === module) {
     main();
 }
+
+// The host half calls these directly (in-process tool execution), so the
+// compute path must be importable without the CLI side effects.
+module.exports = {
+    searchByKeyword,
+    listDetails,
+    readContent,
+    formatKeyword,
+    formatDetail,
+    formatContent,
+    getConfig,
+    HttpError,
+    DocchainError,
+    MAX_LINES_CAP,
+    KEYWORD_RESULT_CAP,
+};

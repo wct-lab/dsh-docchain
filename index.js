@@ -42,6 +42,7 @@ import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import z from "@deepseek-ai/schemastery";
+import { registerDocchainTools } from "./lib/tools/docchain.js";
 
 const PROVIDER_NAME = "dsh-docchain";
 const SKILL_SOURCE = "bundled";
@@ -480,6 +481,37 @@ async function materializeServiceConfig(ctx, config) {
   }
 }
 
+/**
+ * Resolve the service pair a tool call must use, read fresh on every call.
+ *
+ * Deliberately mirrors what `materializeServiceConfig` writes for the scripts
+ * (active environment outranks the legacy single-URL fields) and honours the
+ * same environment variables, because a tool and a `node scripts/...` run for
+ * the same selection must not disagree. Nothing is cached: switching an
+ * environment takes effect on the next call, exactly as it does for the
+ * scripts reading the projection file.
+ *
+ * `topicIds` carries the active environment's selected topics — the same
+ * default scope the image-search script falls back to when no explicit topic
+ * is given.
+ *
+ * @param {object} ctx - the plugin context.
+ * @param {object} config - the resolved row config.
+ * @returns {Promise<{docchain_url: string, docchain_api_key: string, topicIds: number[]}>}
+ */
+async function resolveToolServiceConfig(ctx, config) {
+  const environment = activeEnvironment(config, ctx.logger);
+  const configuredUrl = environment ? environment.url : readField(config, "docchain_url");
+  const refName = environment ? environment.keyRef : keyRefName(config);
+  const literal = environment ? "" : readField(config, "docchain_api_key");
+  const { key } = await resolveApiKey(ctx, refName, literal);
+  return {
+    docchain_url: process.env.DOCCHAIN_URL || configuredUrl || "",
+    docchain_api_key: process.env.DOCCHAIN_API_KEY || key || "",
+    topicIds: environment && Array.isArray(environment.topics) ? environment.topics.map((topic) => topic.id) : [],
+  };
+}
+
 /** Split a SKILL.md into frontmatter scalars (name/description/whenToUse) and the markdown body. */
 export function splitFrontmatter(text) {
   const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
@@ -684,10 +716,32 @@ export function apply(ctx, config) {
       }
     }, "dsh-docchain: selected topics prompt");
   });
+  // Native tools are an upgrade, not a precondition: `tools` goes through
+  // `ctx.inject` so a host without the tool registry still keeps the skill
+  // provider, the projection file and the configuration page instead of
+  // deactivating this plugin entirely.
+  let disposeTools;
+  ctx.inject(["tools"], (scope) => {
+    scope.effect(() => {
+      try {
+        const dispose = registerDocchainTools(scope, () => resolveToolServiceConfig(ctx, config));
+        if (typeof dispose === "function") disposeTools = dispose;
+        return dispose;
+      } catch (error) {
+        scope.logger?.warn?.(`dsh-docchain: cannot register tools: ${error?.message ?? error}`);
+        return () => {};
+      }
+    }, "dsh-docchain: native tools");
+  });
   return () => {
     try {
       offCredentialUpdate?.();
       offSettingsUpdate?.();
+    } catch {
+      // already disposed
+    }
+    try {
+      disposeTools?.();
     } catch {
       // already disposed
     }
