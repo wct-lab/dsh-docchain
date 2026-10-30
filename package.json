@@ -1,11 +1,14 @@
 {
   "name": "dsh-docchain",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "private": true,
   "type": "module",
-  "description": "DSH knowledge base and document conversion plugin: filename/content/metadata search, locate-by-doc_id/name with content reading, topic listing, bulk document upload, document-to-Markdown conversion, image-similarity search, plus a deep-research workflow. Every script-backed capability also ships as a native tool executed in-process; the configuration page keeps switchable docchain environments with per-environment topic selection",
+  "description": "DSH knowledge base and document conversion plugin: filename/content/metadata search, locate-by-doc_id/name with content reading, topic listing, bulk document upload, document-to-Markdown conversion, image-similarity search, per-document image descriptions written to a sidecar markdown, plus a deep-research workflow. Every script-backed capability also ships as a native tool executed in-process; the configuration page keeps switchable docchain environments with per-environment topic selection",
   "icon": "assets/icon.png",
   "license": "MIT",
+  "scripts": {
+    "test": "node --test test/image-describe.test.cjs test/save-guard.test.cjs"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/wct-lab/dsh-docchain"

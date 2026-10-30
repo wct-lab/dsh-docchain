@@ -17,6 +17,7 @@
 | `docchain_meta_search` | 按自定义元数据字段筛选文档（字符串/数值/时间，AND / OR 组） |
 | `docchain_upload` | 把文件或文件夹（仅顶层）批量上传到指定主题 |
 | `docchain_image_search` | 图搜图：用本地图片检索相似图片 |
+| `docchain_image_describe` | 文档图片转文字：逐张生成中文描述并写成旁路描述 md |
 | `doc2markdown` | 把 docx/doc/pdf/pptx/xlsx/图片等解析为 Markdown |
 
 | 技能 | 形态 | 说明 |
@@ -29,6 +30,7 @@
 | `docchain-upload` | SKILL.md + Node.js 脚本 | 把本地文件或整个文件夹批量上传到指定 docchain 主题（工具 `docchain_upload`） |
 | `doc2markdown` | SKILL.md + Node.js 脚本 | 把 docx/doc/pdf/pptx/xlsx/图片等常见格式解析为 Markdown（工具 `doc2markdown`） |
 | `docchain-image-search` | SKILL.md + Node.js 脚本 | 图搜图：给一张图，找库里相似的图片（工具 `docchain_image_search`） |
+| `docchain-image-describe` | SKILL.md + Node.js 脚本 | 文档图片转文字：逐张图片生成中文描述并写成旁路描述 md，主 md 不动（工具 `docchain_image_describe`） |
 | `deep-research-advanced` | 仅 SKILL.md | 主控式多子智能体深度研究工作流（纯指令，无脚本、无工具） |
 
 ## 安装
@@ -158,13 +160,14 @@ Bundle 插入一个 Host 插件（`dsh-docchain`），激活时在 `ctx.skills` 
 | `docchain_meta_search` | `conditions` 为 `[{field, op, value}]`（AND）、`or_groups` 组内 OR 组间 AND；`list_fields: true` 列字段 |
 | `docchain_upload` | `path` + `topic_id` 必填；`mode` 取 `file`/`folder`（仅顶层） |
 | `docchain_image_search` | `image` 必填；`topic_ids` 省略则用配置页选中主题；`all` 扫全库 |
+| `docchain_image_describe` | `doc_ids` 直接处理；只给 `keyword` 时**仅返回候选**；`read` 读回已生成的描述 md；`list_models` 看可用视觉模型；批量 >1 篇需 `confirm` |
 | `doc2markdown` | `file_path` 必填；`action` 取 `convert`/`check`；`md_only` 只导出单个 md |
 
 实现上工具与脚本**共用同一份代码**：宿主 `require` 脚本模块后调用其导出的计算函数，所以工具结果与 `node scripts/...` 的输出不会分叉。工具注册走 `ctx.inject(["tools"])`——宿主没有工具服务时，技能、投影文件与配置页照常工作，只是没有这些工具。
 
 工具失败时返回 `{ ok: false, error, message }`，`error` 取值与脚本一致：`CONFIG` / `NO_RESULTS` / `NOT_FOUND` / `NO_PERMISSION` / `SERVER_ERROR`（`doc2markdown` 另有 `PENDING`，表示仍在转换、用 `check` 继续）。参数一律用数组或对象（`doc_ids: [1, 2]`），不再拼逗号字符串。
 
-`docchain_upload` 与 `doc2markdown` 的 `convert` 标记为**不可并发**（前者写知识库、后者是长流程）；其余检索类工具可并发。
+`docchain_upload`、`docchain_image_describe` 与 `doc2markdown` 的 `convert` 标记为**不可并发**（前者写知识库、中间那个是长任务、后者是长流程）；其余检索类工具可并发。
 
 ## 技能详解
 
@@ -269,6 +272,42 @@ Bundle 插入一个 Host 插件（`dsh-docchain`），激活时在 `ctx.skills` 
 - 能否搜到**按主题**区分：图片向量是一个主题一个主题建立的，没做过向量化的主题对任何查询都返回空（实测：同一实例上有向量的主题能命中、没有的恒为空）。脚本会把这种情况说明白，而不是让你以为库里没有；
 - 个别图片会让服务端返回 HTTP 500（那张图处理不了），脚本会按主题记录并如实提示，不会静默失败；
 - `--all` 会遍历全部主题，慢且请求量大（数千次查询）。知道主题时优先用选中的主题。
+
+### docchain-image-describe（文档图片转文字）
+
+把文档里的图片转成文字：读文档主 md → 逐张图片交给多模态模型生成中文描述 → 在每张图片上方插入 `<!-- image-desc: … -->` → 写成该文档的**旁路描述 md**。
+
+**主 md 一字不动**：描述存在独立文件里，用 `GET /v1/doc/read?doc_id=<id>&read_format=image_description_md` 读回。因此普通阅读行为不受影响，chat-agent 需要图片语义时才读这份旁路文件。
+
+**用法**：
+
+- "把 125755 里的图片都转成文字"
+- "先跑 2 张看看效果"（`max_images: 2`）
+- "帮我搜名字带'大语言模型'的文档，我自己选"（只给 `keyword`，**只返回候选清单**，不处理）
+- "125755 的图片描述生成好了吗？"（`read: true`）
+- "这台机器能用哪些视觉模型？"（`list_models: true`）
+
+需要注意：
+
+- **时间**：描述按"信息密度"生成（平均约 350–400 字符），单张约 8–12 秒；185 张图、并发 8 约 **4–6 分钟**。建议先 `max_images: 2` 试跑估时；
+- **精度优先**：提示词要求专有名词/字段名/单位/数值/公式**照抄原文**，同时删掉纯装饰描述（圆角、线条、填充）与重复句 —— 实测比"完整还原"版短 57%，信息量反而更高；
+- **长度**：单条上限默认 **2000** 字符（`docchain_vision_max_desc_chars` 可调）；超长时**先让模型压缩**（保留名称/数值/公式，删修饰语），压不下来才按句末截断。结果里三个计数要分清：`compressed`（走了压缩）、`truncated`（最终仍被砍）、`incomplete`（撞上 max_tokens，内容停在半句）—— **后两者不为 0 才说明真的丢信息**；
+- **并发**：8 是实测最优点（12 起被网关限流 429，3/4 反而更慢）；
+- **幂等口径**：每次从干净的主 md 重新生成，结构不会累积；但模型输出有波动，重复跑的产物不保证逐字相同；
+- **体积**：185 张图的描述 md 约 1.4 MB；>400 张图会提示 `LARGE_PAYLOAD`；
+- **描述是模型读图的结果**，密集表格与公式可能误读，关键数据请回看原图。
+
+**视觉模型配置**：默认 `https://lab.iwhalecloud.com/gpt-proxy/v1` + `qwen3-vl-plus`，Key 取凭据库的 `IWHALE_API_KEY`。要换模型/地址/长度上限，改这几个字段（配置页不渲染输入框，改设置文档即可）：
+
+```yaml
+docchain_vision_url: https://lab.iwhalecloud.com/gpt-proxy/v1
+docchain_vision_model: qwen3-vl-plus
+docchain_vision_fallback_model: g-deepseek-v4-flash   # 主模型不可用时自动降级一次
+docchain_vision_key_ref: IWHALE_API_KEY               # 凭据引用名
+docchain_vision_max_desc_chars: 1200                  # 单条描述字数上限（超出按句末截断）
+```
+
+CLI 用环境变量：`VISION_BASE_URL` / `VISION_MODEL` / `VISION_API_KEY` / `VISION_MAX_DESC_CHARS`。用 `list_models` 可以先看这把 key 到底能用哪些视觉模型。
 
 ### deep-research-advanced（高级深度研究）
 

@@ -17,6 +17,7 @@ Apart from `deep-research-advanced` (a pure instruction workflow with no script)
 | `docchain_meta_search` | Filter documents by custom metadata fields (string/number/time, AND / OR groups) |
 | `docchain_upload` | Upload a file, or a folder's top-level files, to a topic |
 | `docchain_image_search` | Image-to-image search with a local picture |
+| `docchain_image_describe` | Turn a document's images into text: describe each image and save a sidecar description markdown |
 | `doc2markdown` | Convert docx/doc/pdf/pptx/xlsx/images and more to Markdown |
 
 | Skill | Kind | Description |
@@ -29,6 +30,7 @@ Apart from `deep-research-advanced` (a pure instruction workflow with no script)
 | `docchain-upload` | SKILL.md + Node.js script | Upload a local file or a whole folder to a given docchain topic in bulk (tool: `docchain_upload`) |
 | `doc2markdown` | SKILL.md + Node.js script | Convert docx/doc/pdf/pptx/xlsx/images and many more formats to Markdown via the docchain parsing service (tool: `doc2markdown`) |
 | `docchain-image-search` | SKILL.md + Node.js script | Find similar images by example (tool: `docchain_image_search`) |
+| `docchain-image-describe` | SKILL.md + Node.js script | Turn a document's images into text: describe each image and save a sidecar description markdown, leaving the main md untouched (tool: `docchain_image_describe`) |
 | `deep-research-advanced` | SKILL.md only | Orchestrator-style multi-subagent deep research workflow (pure instructions, no scripts, no tool) |
 
 ## Installation
@@ -158,13 +160,14 @@ Every script-backed capability is registered as a DSH tool, so the model calls i
 | `docchain_meta_search` | `conditions` as `[{field, op, value}]` (AND), `or_groups` (OR inside, AND across); `list_fields: true` lists fields |
 | `docchain_upload` | `path` + `topic_id` required; `mode` is `file` or `folder` (top level only) |
 | `docchain_image_search` | `image` required; omitted `topic_ids` falls back to the page's selected topics; `all` scans everything |
+| `docchain_image_describe` | `doc_ids` processes directly; `keyword` alone returns **candidates only**; `read` returns an already-generated description md; `list_models` lists usable vision models; batches of >1 need `confirm` |
 | `doc2markdown` | `file_path` required; `action` is `convert` or `check`; `md_only` exports a single md |
 
 Tools and scripts share **one implementation**: the host requires the script modules and calls their exported compute functions, so a tool result cannot drift from a `node scripts/...` run. Registration goes through `ctx.inject(["tools"])`, so a host without the tool registry keeps the skills, the projection file and the configuration page — it just has no tools.
 
 Failures return `{ ok: false, error, message }` with the same `error` values as the scripts: `CONFIG` / `NO_RESULTS` / `NOT_FOUND` / `NO_PERMISSION` / `SERVER_ERROR`. `doc2markdown` adds `PENDING` for "still converting, call `check` later". Arguments are arrays or objects (`doc_ids: [1, 2]`), never comma-joined strings.
 
-`docchain_upload` and the `convert` action of `doc2markdown` are marked non-concurrency-safe (one writes to the knowledge base, the other is a long pipeline); the search tools may run in parallel.
+`docchain_upload`, `docchain_image_describe` and the `convert` action of `doc2markdown` are marked non-concurrency-safe (one writes to the knowledge base, one is a long job, the other is a long pipeline); the search tools may run in parallel.
 
 ## Skills
 
@@ -269,6 +272,42 @@ Things worth knowing:
 - Availability is **per topic**: image vectors are built one topic at a time, so a topic that was never vectorized answers every query with an empty list (observed: on the same instance, topics with vectors match and topics without return nothing). The script says so instead of pretending the library has nothing.
 - A few images make the service answer HTTP 500 (that picture cannot be processed); the script reports it per topic instead of failing silently.
 - `--all` walks every topic — slow and request-heavy (thousands of queries). Prefer the selected topics when you know them.
+
+### docchain-image-describe — turn a document's images into text
+
+Reads the document's main markdown, hands each image to a multimodal model for a Chinese description, inserts `<!-- image-desc: … -->` directly above every image, and saves the result as that document's **sidecar description markdown**.
+
+**The main markdown is never touched**: descriptions live in a separate file, read back with `GET /v1/doc/read?doc_id=<id>&read_format=image_description_md`. Normal reading behaviour is therefore unchanged, and a chat agent reads the sidecar only when it needs the picture semantics.
+
+**How to use it**:
+
+- "Turn every image in 125755 into text"
+- "Try 2 images first" (`max_images: 2`)
+- "Find documents named like…, I'll pick one" (`keyword` alone returns **candidates only** and processes nothing)
+- "Is 125755's description ready?" (`read: true`)
+- "Which vision models can this machine use?" (`list_models: true`)
+
+Things worth knowing:
+
+- **Time**: descriptions target information density (avg ~350–400 characters), so one image takes ~8–12 s; 185 images at concurrency 8 take **about 4–6 minutes**. Run `max_images: 2` first to extrapolate.
+- **Precision over verbosity**: proper nouns, field names, units, numbers and formulas are copied verbatim, while pure decoration (rounded corners, line styles, fills) and repeated clauses are dropped — measured 57% shorter than the "full fidelity" prompt, with more information rather than less.
+- **Length**: one description is capped at 2000 characters by default (`docchain_vision_max_desc_chars`). Overlong results are first **compressed by the model** (names/numbers/formulas kept, modifiers dropped); only what still overflows is cut at a sentence boundary. Three counters tell the story: `compressed` (went through compression), `truncated` (still cut), `incomplete` (hit max_tokens, content stops mid-sentence) — only a non-zero `truncated`/`incomplete` means information was lost.
+- **Concurrency**: 8 is the measured sweet spot; from 12 the gateway answers 429, and 3/4 are actually slower (gateway batching).
+- **Idempotency**: each run rebuilds from the clean main md, so markers never accumulate — but model output varies, so two runs are not byte-identical.
+- **Size**: 185 images produce roughly a 1.4 MB description markdown; above 400 images the result carries a `LARGE_PAYLOAD` warning.
+- **Descriptions are model readings**: dense tables and formulas can be misread — check the original image for critical numbers.
+
+**Vision model configuration**: defaults to `https://lab.iwhalecloud.com/gpt-proxy/v1` with `qwen3-vl-plus`, keyed by the `IWHALE_API_KEY` credential. To change model, endpoint or length cap, edit these fields (the configuration page does not render inputs for them):
+
+```yaml
+docchain_vision_url: https://lab.iwhalecloud.com/gpt-proxy/v1
+docchain_vision_model: qwen3-vl-plus
+docchain_vision_fallback_model: g-deepseek-v4-flash   # used once when the primary model is unavailable
+docchain_vision_key_ref: IWHALE_API_KEY               # credential reference name
+docchain_vision_max_desc_chars: 1200                  # per-description character cap
+```
+
+The CLI uses `VISION_BASE_URL` / `VISION_MODEL` / `VISION_API_KEY` / `VISION_MAX_DESC_CHARS` instead. Use `list_models` to see which vision models your key can actually reach.
 
 ### deep-research-advanced — multi-subagent deep research
 

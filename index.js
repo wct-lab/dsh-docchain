@@ -69,6 +69,17 @@ export const CONFIG_FILE = path.join(os.homedir(), ".dsh", "storages", "docchain
 /** Default credential-reference name for the docchain API key. */
 export const DEFAULT_KEY_REF = "DOCCHAIN_API_KEY";
 
+/** Default credential-reference name for the multimodal model gateway key. */
+export const DEFAULT_VISION_KEY_REF = "IWHALE_API_KEY";
+/** Default gateway endpoint for image descriptions (OpenAI-compatible). */
+export const DEFAULT_VISION_URL = "https://lab.iwhalecloud.com/gpt-proxy/v1";
+/** Default vision model: a VL-specific model; measured best on Chinese charts. */
+export const DEFAULT_VISION_MODEL = "qwen3-vl-plus";
+/** Fallback when the primary model is not enabled for the account. */
+export const DEFAULT_VISION_FALLBACK_MODEL = "g-deepseek-v4-flash";
+/** Default cap on one description (characters); keeps one image = one line. */
+export const DEFAULT_VISION_MAX_DESC_CHARS = 1200;
+
 /**
  * Row config schema — a schemastery schema, the host's native config library.
  *
@@ -94,6 +105,28 @@ export const Config = z.object({
     .string()
     .volatile()
     .description("常用环境列表（JSON）：{version,active,items:[{id,name,url,keyRef}]}；有生效环境时优先于 docchain_url"),
+  docchain_vision_url: z
+    .string()
+    .volatile()
+    .description(`多模态模型网关地址（OpenAI 兼容），默认 ${DEFAULT_VISION_URL}`),
+  docchain_vision_model: z
+    .string()
+    .volatile()
+    .description(`生成图片描述用的模型，默认 ${DEFAULT_VISION_MODEL}`),
+  docchain_vision_fallback_model: z
+    .string()
+    .volatile()
+    .description(`主模型不可用时的降级模型，默认 ${DEFAULT_VISION_FALLBACK_MODEL}`),
+  docchain_vision_key_ref: z
+    .string()
+    .volatile()
+    .description(`多模态模型 Key 的凭据引用名，默认 ${DEFAULT_VISION_KEY_REF}`),
+  docchain_vision_max_desc_chars: z
+    .string()
+    .volatile()
+    .description(
+      `单条描述的字数上限，默认 ${DEFAULT_VISION_MAX_DESC_CHARS}；超出部分按句末截断，并在结果里计入 truncated`,
+    ),
 });
 
 /**
@@ -211,7 +244,13 @@ function collectRefs(config, logger) {
   const refs = new Set([keyRefName(config)]);
   const environments = parseEnvironments(config, logger);
   if (environments) for (const item of environments.items) refs.add(item.keyRef);
+  refs.add(visionKeyRefName(config));
   return refs;
+}
+
+/** The credential-reference name the row resolves its vision-model key from. */
+function visionKeyRefName(config) {
+  return readField(config, "docchain_vision_key_ref") || DEFAULT_VISION_KEY_REF;
 }
 
 /** Send one JSON answer; every outcome of the topic route goes through here. */
@@ -467,6 +506,18 @@ async function materializeServiceConfig(ctx, config) {
     next.docchain_topic_ids = environment.topics.map((topic) => topic.id);
     next.docchain_topic_names = environment.topics.map((topic) => topic.name);
   }
+  // The vision-model settings travel with the projection so a CLI run can pick
+  // them up from the same file. The KEY is deliberately absent: the tool path
+  // resolves it from the credential store at call time, so this file never
+  // carries a second vendor secret.
+  const visionUrl = readField(config, "docchain_vision_url");
+  const visionModel = readField(config, "docchain_vision_model");
+  const visionFallback = readField(config, "docchain_vision_fallback_model");
+  const visionMaxChars = readField(config, "docchain_vision_max_desc_chars");
+  if (visionUrl) next.docchain_vision_url = visionUrl;
+  if (visionModel) next.docchain_vision_model = visionModel;
+  if (visionFallback) next.docchain_vision_fallback_model = visionFallback;
+  if (visionMaxChars) next.docchain_vision_max_desc_chars = visionMaxChars;
   const rendered = `${JSON.stringify(next, null, 2)}\n`;
   if (current === rendered) return; // unchanged; no rewrite, no log
   try {
@@ -505,10 +556,33 @@ async function resolveToolServiceConfig(ctx, config) {
   const refName = environment ? environment.keyRef : keyRefName(config);
   const literal = environment ? "" : readField(config, "docchain_api_key");
   const { key } = await resolveApiKey(ctx, refName, literal);
+  // Vision-model key: env var wins (same override rule as the docchain pair),
+  // then the credential store. Nothing is cached, so rotating the key in the
+  // credential store reaches the next call without a restart.
+  const visionRef = visionKeyRefName(config);
+  let visionKey = process.env.VISION_API_KEY || "";
+  if (!visionKey) {
+    const resolved = await resolveApiKey(ctx, visionRef, "");
+    visionKey = resolved.key || "";
+  }
   return {
     docchain_url: process.env.DOCCHAIN_URL || configuredUrl || "",
     docchain_api_key: process.env.DOCCHAIN_API_KEY || key || "",
     topicIds: environment && Array.isArray(environment.topics) ? environment.topics.map((topic) => topic.id) : [],
+    vision: {
+      url: process.env.VISION_BASE_URL || readField(config, "docchain_vision_url") || DEFAULT_VISION_URL,
+      model: process.env.VISION_MODEL || readField(config, "docchain_vision_model") || DEFAULT_VISION_MODEL,
+      fallbackModel:
+        process.env.VISION_FALLBACK_MODEL ||
+        readField(config, "docchain_vision_fallback_model") ||
+        DEFAULT_VISION_FALLBACK_MODEL,
+      // 不在这里填默认值：默认值只有一处（脚本里的 DESC_MAX_CHARS），
+      // 否则两处常量会漂移（实测 index.js 的 1200 覆盖了脚本里的 1500）。
+      maxDescChars:
+        Number(process.env.VISION_MAX_DESC_CHARS || readField(config, "docchain_vision_max_desc_chars")) || undefined,
+      key: visionKey,
+      keyRef: visionRef,
+    },
   };
 }
 
