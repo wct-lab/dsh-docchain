@@ -131,9 +131,9 @@ export const Config = z.object({
   neo4j_uri: z
     .string()
     .volatile()
-    .description("Neo4j 连接地址（Bolt），如 neo4j://<host>:17687；知识图谱直连工具（列文档/检索实体/查看子图）用"),
+    .description("Neo4j 连接地址（Bolt），如 neo4j://<host>:17687；保留供将来直连工具复用（当前无工具使用）"),
   neo4j_user: z.string().volatile().description("Neo4j 用户名，默认 neo4j"),
-  neo4j_password: z.string().volatile().description("Neo4j 密码；仅直连工具需要，API 工具无需"),
+  neo4j_password: z.string().volatile().description("Neo4j 密码；保留供将来直连工具复用（当前图谱工具全部走 API，无需此字段）"),
   neo4j_database: z.string().volatile().description("Neo4j 数据库名，默认 neo4j"),
 });
 

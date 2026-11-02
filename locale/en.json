@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "DocChain 文档与知识图谱",
-    "description": "DocChain document search/upload/conversion/image-description and deep-research, plus a knowledge graph (Neo4j): ontology inspection, read-only Cypher, and node/relation writes via the DocChain API; listing documents, searching entities, and viewing subgraphs connect straight to Neo4j. Switchable docchain environments with per-environment topic selection."
+    "description": "DocChain document search/upload/conversion/image-description and deep-research, plus a knowledge graph (Neo4j): ontology inspection, read-only Cypher, and node/relation writes all via the DocChain API (no Neo4j password needed). Switchable docchain environments with per-environment topic selection."
   }
 }

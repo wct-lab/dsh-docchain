@@ -2,7 +2,7 @@
 
 [English](./README.md) | 中文
 
-一个知识库和文档转换 DSH 插件，内置文件名/内容/元数据检索、主题查询、文档批量上传、文档转 Markdown 解析、多子智能体深度研究工作流，以及知识图谱（Neo4j）能力：查本体结构、执行只读 Cypher、增删改图谱节点/关系走 DocChain API，列文档、检索实体、查看子图直连 Neo4j。任意机器上用 `plugin_manager install_bundle` 安装即可生效，无需手动拷贝到 `~/.agents/skills`。
+一个知识库和文档转换 DSH 插件，内置文件名/内容/元数据检索、主题查询、文档批量上传、文档转 Markdown 解析、多子智能体深度研究工作流，以及知识图谱（Neo4j）能力：查本体结构、执行只读 Cypher、增删改图谱节点/关系，全部走 DocChain API（无需 Neo4j 密码）。任意机器上用 `plugin_manager install_bundle` 安装即可生效，无需手动拷贝到 `~/.agents/skills`。
 
 它的配置页不止一个服务地址：可以保存一组**常用环境**（每个环境有自己的地址与凭据）并一键切换，还能按环境预选**主题**，之后直接说"在这个主题里搜"而不必报 id。
 
@@ -25,9 +25,6 @@
 | `docchain_kg_upsert_relation` | 新增本体或实体关系，走 DocChain API |
 | `docchain_kg_delete_node` | 删除节点（连带其关系），走 DocChain API |
 | `docchain_kg_delete_relation` | 删除关系，走 DocChain API |
-| `docchain_kg_documents` | 列图谱中的文档（Document 节点），直连 Neo4j |
-| `docchain_kg_search` | 按关键字检索图谱节点，直连 Neo4j |
-| `docchain_kg_graph` | 查看文档子图或标签抽样，直连 Neo4j |
 
 | 技能 | 形态 | 说明 |
 |---|---|---|
@@ -41,7 +38,7 @@
 | `docchain-image-search` | SKILL.md + Node.js 脚本 | 图搜图：给一张图，找库里相似的图片（工具 `docchain_image_search`） |
 | `docchain-image-describe` | SKILL.md + Node.js 脚本 | 文档图片转文字：逐张图片生成中文描述并写成旁路描述 md，主 md 不动（工具 `docchain_image_describe`） |
 | `deep-research-advanced` | 仅 SKILL.md | 主控式多子智能体深度研究工作流（纯指令，无脚本、无工具） |
-| `docchain-kg` | 仅 SKILL.md | DocChain 知识图谱：查本体/执行 Cypher/写操作走 DocChain API，列文档/检索实体/查看子图直连 Neo4j（工具 `docchain_kg_*`） |
+| `docchain-kg` | 仅 SKILL.md | DocChain 知识图谱：查本体/执行 Cypher/写操作，全部走 DocChain API（工具 `docchain_kg_*`） |
 
 ## 安装
 
@@ -99,9 +96,9 @@ plugin_manager install_bundle target=<本目录绝对路径>
 | `docchain_api_key_ref` | API Key 的凭据引用名，默认 `DOCCHAIN_API_KEY` |
 | `docchain_api_key` | 备用：直接写死 Key（不推荐；凭据存储优先） |
 | `docchain_environments` | 常用环境列表（JSON）：每个环境的名称、地址、凭据引用名以及预选主题；生效环境优先于 `docchain_url` |
-| `neo4j_uri` | Neo4j 连接地址（Bolt），如 `neo4j://<host>:17687`；知识图谱直连工具用 |
+| `neo4j_uri` | Neo4j 连接地址（Bolt），如 `neo4j://<host>:17687`；保留供将来直连工具复用（当前无工具使用） |
 | `neo4j_user` | Neo4j 用户名，默认 `neo4j` |
-| `neo4j_password` | Neo4j 密码；仅直连工具（列文档/检索实体/查看子图）需要，走 API 的图谱工具无需 |
+| `neo4j_password` | Neo4j 密码；保留供将来直连工具复用（当前图谱工具全部走 API，无需此字段） |
 | `neo4j_database` | Neo4j 数据库名，默认 `neo4j` |
 
 Key 的实际值保存在**凭据存储** `~/.dsh/.credentials.yaml`（`refs:` 段，仅本用户可读）——可通过配置页写入或直接编辑文件，改动热生效；也可以用同名启动环境变量提供。激活时、存储凭据变化时、以及本行设置保存时，解析出的值会被镜像写入 `~/.dsh/storages/docchain-config.json`（权限 `0600`）：该文件是当前解析结果的纯投影，配置清空后对应条目随之消失；脚本每次运行读取该文件。
@@ -182,9 +179,6 @@ Bundle 插入一个 Host 插件（`dsh-docchain`），激活时在 `ctx.skills` 
 | `docchain_kg_upsert_relation` | `topic_id` + `relation_type` + `source` + `target` 必填；实体关系还需 `ontology_id` |
 | `docchain_kg_delete_node` | `topic_id` + `entity_id` 必填（连带删除其所有关系） |
 | `docchain_kg_delete_relation` | `topic_id` + `relation_id` 必填 |
-| `docchain_kg_documents` | `topic_id` / `keyword` 可选过滤；`limit` 上限 |
-| `docchain_kg_search` | `keyword` 必填；`label` 可选限定标签 |
-| `docchain_kg_graph` | `document`（文档名）或 `label`（标签）二选一 |
 
 实现上工具与脚本**共用同一份代码**：宿主 `require` 脚本模块后调用其导出的计算函数，所以工具结果与 `node scripts/...` 的输出不会分叉。工具注册走 `ctx.inject(["tools"])`——宿主没有工具服务时，技能、投影文件与配置页照常工作，只是没有这些工具。
 

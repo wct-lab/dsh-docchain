@@ -1,12 +1,12 @@
 ---
 name: docchain-kg
-description: DocChain 知识图谱。走 DocChain API（无需 Neo4j 密码）：查本体结构（schema）、执行 Cypher（cypher）、写操作（本体/实体/关系增删）；直连 Neo4j（需密码）：列文档（documents）、检索实体（search）、查看子图（graph）。
+description: DocChain 知识图谱。全部走 DocChain API（无需 Neo4j 密码）：查本体结构（schema）、执行 Cypher（cypher）、写操作（本体/实体/关系增删）。
 whenToUse: 用户问及 DocChain 知识图谱、实体/关系、图谱节点、本体、Neo4j，或需要新增/编辑/删除图谱节点与关系时使用。
 ---
 
 # DocChain 知识图谱
 
-用插件 `dsh-docchain` 提供的工具。走 DocChain HTTP API（X-Api-Key 认证，配置页 docchain_url 与 API Key，无需 Neo4j 密码）：查本体结构（schema）、执行 Cypher（cypher）、写操作（本体/实体/关系增删）；直连 Neo4j（`neo4j://10.10.185.13:17687`，账号密码见配置页 neo4j_* 字段）：列文档（documents）、检索实体（search）、查看子图（graph）。
+用插件 `dsh-docchain` 提供的工具。全部走 DocChain HTTP API（X-Api-Key 认证，配置页 docchain_url 与 API Key，无需 Neo4j 密码）：查本体结构（schema）、执行 Cypher（cypher）、写操作（本体/实体/关系增删）。
 
 ## 图谱结构
 
@@ -16,10 +16,8 @@ whenToUse: 用户问及 DocChain 知识图谱、实体/关系、图谱节点、�
 ## 典型流程
 
 1. `docchain_kg_schema`（topic_id=…）—— 查该主题的本体结构（实体类型 + 关系类型，含属性定义）。
-2. `docchain_kg_documents` —— 列文档（可按 topic_id / 关键字过滤），拿到文档名。
-3. `docchain_kg_graph`（document=文档名）—— 看该文档 CONTAINS 关联的实体节点及其属性。
-4. `docchain_kg_search`（keyword=…）—— 按关键字定位实体。
-5. 需要精确/组合查询时用 `docchain_kg_cypher`（topic_id=… + cypher）执行 Cypher。
+2. `docchain_kg_cypher`（topic_id=… + cypher）—— 定位实体、查关系、看子图，或做任意组合查询（如 `MATCH (n) WHERE n.entity_name CONTAINS '关键字' RETURN n`）。
+3. 列文档用文档工具（`docchain_doc_search` / `docchain_filename_search`），不用图谱工具。
 
 ## 图谱编辑（写操作，走 DocChain API，无需 Neo4j 密码）
 
@@ -37,7 +35,7 @@ whenToUse: 用户问及 DocChain 知识图谱、实体/关系、图谱节点、�
 - `docchain_kg_cypher` 只读（MATCH/CALL/SHOW…RETURN，走 DocChain API）；写操作用上面的专用工具（走 DocChain API），不要用 cypher 工具执行写语句。
 - 写操作不可撤销，执行前先向用户确认；各写工具会返回生成的 entity_id/relation_id。
 - 本体节点用标签 `:ontology`，实体节点用标签 `:Entity`；关系（本体/实体）都用业务名作 Neo4j 关系类型。这些落库形态由后端/DocChain 负责，插件侧只需传业务名与 id。
-- 编辑/删除需先有 entity_id / relation_id，不确定时先用 `docchain_kg_search` 检索确认。
+- 编辑/删除需先有 entity_id / relation_id，不确定时先用 `docchain_kg_cypher` 检索确认。
 - 节点属性里的 `embedding`（向量）和 `origin_json`（原始 JSON）会被读工具自动跳过，避免刷屏。
 - 单次返回行数受 `maxRecords`（默认 50）限制。
-- schema / cypher / 写操作按 `topic_id` 路由到主题库；documents / search / graph 仍可直连 Neo4j，用 `database=docchaintopic{topic_id}` 指定库。
+- schema / cypher / 写操作按 `topic_id` 路由到主题库。

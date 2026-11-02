@@ -2,7 +2,7 @@
 
 English | [中文](./README.zh-CN.md)
 
-A DSH knowledge base and document conversion plugin bundling filename/content/metadata search, topic listing, bulk document upload, document-to-Markdown conversion, a multi-subagent deep-research workflow, and a knowledge-graph (Neo4j) layer — ontology inspection, read-only Cypher, and node/relation writes go through the DocChain API, while listing documents, searching entities, and viewing subgraphs connect straight to Neo4j: install once with `plugin_manager install_bundle` and it works on any machine — no manual copying into `~/.agents/skills` required. Built on docchain.
+A DSH knowledge base and document conversion plugin bundling filename/content/metadata search, topic listing, bulk document upload, document-to-Markdown conversion, a multi-subagent deep-research workflow, and a knowledge-graph (Neo4j) layer — ontology inspection, read-only Cypher, and node/relation writes all go through the DocChain API (no Neo4j password needed): install once with `plugin_manager install_bundle` and it works on any machine — no manual copying into `~/.agents/skills` required. Built on docchain.
 
 Its configuration page goes beyond a single endpoint: it keeps a list of **saved environments** — each with its own address and its own credential — switches between them in one click, and pre-selects **topics** per environment, so a later request can say "search this topic" without naming an id.
 
@@ -25,9 +25,6 @@ Apart from `deep-research-advanced` (a pure instruction workflow with no script)
 | `docchain_kg_upsert_relation` | Create an ontology or entity relationship, via the DocChain API |
 | `docchain_kg_delete_node` | Delete a node (and its relationships), via the DocChain API |
 | `docchain_kg_delete_relation` | Delete a relationship, via the DocChain API |
-| `docchain_kg_documents` | List documents (Document nodes) in the graph, direct Neo4j |
-| `docchain_kg_search` | Search graph nodes by keyword, direct Neo4j |
-| `docchain_kg_graph` | View a document's subgraph or a label sample, direct Neo4j |
 
 | Skill | Kind | Description |
 |---|---|---|
@@ -41,7 +38,7 @@ Apart from `deep-research-advanced` (a pure instruction workflow with no script)
 | `docchain-image-search` | SKILL.md + Node.js script | Find similar images by example (tool: `docchain_image_search`) |
 | `docchain-image-describe` | SKILL.md + Node.js script | Turn a document's images into text: describe each image and save a sidecar description markdown, leaving the main md untouched (tool: `docchain_image_describe`) |
 | `deep-research-advanced` | SKILL.md only | Orchestrator-style multi-subagent deep research workflow (pure instructions, no scripts, no tool) |
-| `docchain-kg` | SKILL.md only | DocChain knowledge graph: ontology/Cypher/writes via the DocChain API, documents/entity-search/subgraph direct Neo4j (tools: `docchain_kg_*`) |
+| `docchain-kg` | SKILL.md only | DocChain knowledge graph: ontology/Cypher/writes all via the DocChain API (tools: `docchain_kg_*`) |
 
 ## Installation
 
@@ -99,9 +96,9 @@ The plugin follows the official credential pattern. Its Config schema declares:
 | `docchain_api_key_ref` | Credential reference name for the key; default `DOCCHAIN_API_KEY` |
 | `docchain_api_key` | Fallback literal key (not recommended; the store wins over it) |
 | `docchain_environments` | Saved environments (JSON): per entry a name, URL, credential reference and its pre-selected topics; the active entry outranks `docchain_url` |
-| `neo4j_uri` | Neo4j Bolt endpoint, e.g. `neo4j://<host>:17687`; used by the direct graph tools |
+| `neo4j_uri` | Neo4j Bolt endpoint, e.g. `neo4j://<host>:17687`; kept for future direct graph tools (currently unused) |
 | `neo4j_user` | Neo4j username, default `neo4j` |
-| `neo4j_password` | Neo4j password; only the direct tools (documents/entity-search/subgraph) need it — the API-routed graph tools do not |
+| `neo4j_password` | Neo4j password; kept for future direct graph tools (all graph tools currently use the API) |
 | `neo4j_database` | Neo4j database name, default `neo4j` |
 
 The key's value lives in the **credential store** `~/.dsh/.credentials.yaml` (`refs:` section, owner-only permissions) — save it through the configuration page or edit the file directly; changes hot-reload. It can also come from the launch environment under the same variable name. On activation, whenever a stored credential changes, and whenever this row's settings are saved, the resolved values are mirrored into `~/.dsh/storages/docchain-config.json` (permissions `0600`): the file is a pure projection of the current resolution, so a cleared config entry disappears from it; the scripts read it on every run.
@@ -182,9 +179,6 @@ Every script-backed capability is registered as a DSH tool, so the model calls i
 | `docchain_kg_upsert_relation` | `topic_id` + `relation_type` + `source` + `target` required; entity relations also need `ontology_id` |
 | `docchain_kg_delete_node` | `topic_id` + `entity_id` required (removes its relationships too) |
 | `docchain_kg_delete_relation` | `topic_id` + `relation_id` required |
-| `docchain_kg_documents` | optional `topic_id` / `keyword` filters; `limit` caps rows |
-| `docchain_kg_search` | `keyword` required; optional `label` restricts the node label |
-| `docchain_kg_graph` | `document` (document name) or `label` — exactly one |
 
 Tools and scripts share **one implementation**: the host requires the script modules and calls their exported compute functions, so a tool result cannot drift from a `node scripts/...` run. Registration goes through `ctx.inject(["tools"])`, so a host without the tool registry keeps the skills, the projection file and the configuration page — it just has no tools.
 
