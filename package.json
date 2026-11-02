@@ -3,7 +3,7 @@
   "version": "1.9.0",
   "private": true,
   "type": "module",
-  "description": "DSH knowledge base and document conversion plugin: filename/content/metadata search, locate-by-doc_id/name with content reading, topic listing, bulk document upload, document-to-Markdown conversion, image-similarity search, per-document image descriptions written to a sidecar markdown, plus a deep-research workflow. Every script-backed capability also ships as a native tool executed in-process; the configuration page keeps switchable docchain environments with per-environment topic selection",
+  "description": "DSH knowledge base and document conversion plugin: filename/content/metadata search, locate-by-doc_id/name with content reading, topic listing, bulk document upload, document-to-Markdown conversion, image-similarity search, per-document image descriptions written to a sidecar markdown, a deep-research workflow, and a knowledge-graph (Neo4j) layer — ontology inspection, read-only Cypher, and node/relation writes go through the DocChain API, while listing documents, searching entities, and viewing subgraphs connect straight to Neo4j. Every script-backed capability also ships as a native tool executed in-process; the configuration page keeps switchable docchain environments with per-environment topic selection",
   "icon": "assets/icon.png",
   "license": "MIT",
   "scripts": {
@@ -22,9 +22,14 @@
   "peerDependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
   },
+  "dependencies": {
+    "neo4j-driver": "^5.22.0"
+  },
   "dsh": {
     "bundle": {
-      "patch": "./cordis.patch.yml"
+      "patch": "./cordis.patch.yml",
+      "title": "DocChain 文档与知识图谱",
+      "description": "DocChain 文档检索/上传/转换/图片描述与深度研究，以及知识图谱：查本体结构、执行 Cypher、写操作走 DocChain API；列文档、检索实体、查看文档子图直连 Neo4j。"
     },
     "client": {
       "inject": [

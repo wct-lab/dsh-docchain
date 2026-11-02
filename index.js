@@ -43,6 +43,7 @@ import os from "node:os";
 import path from "node:path";
 import z from "@deepseek-ai/schemastery";
 import { registerDocchainTools } from "./lib/tools/docchain.js";
+import { registerKgTools } from "./lib/tools/kg.js";
 
 const PROVIDER_NAME = "dsh-docchain";
 const SKILL_SOURCE = "bundled";
@@ -127,6 +128,13 @@ export const Config = z.object({
     .description(
       `单条描述的字数上限，默认 ${DEFAULT_VISION_MAX_DESC_CHARS}；超出部分按句末截断，并在结果里计入 truncated`,
     ),
+  neo4j_uri: z
+    .string()
+    .volatile()
+    .description("Neo4j 连接地址（Bolt），如 neo4j://<host>:17687；知识图谱直连工具（列文档/检索实体/查看子图）用"),
+  neo4j_user: z.string().volatile().description("Neo4j 用户名，默认 neo4j"),
+  neo4j_password: z.string().volatile().description("Neo4j 密码；仅直连工具需要，API 工具无需"),
+  neo4j_database: z.string().volatile().description("Neo4j 数据库名，默认 neo4j"),
 });
 
 /**
@@ -569,6 +577,12 @@ async function resolveToolServiceConfig(ctx, config) {
     docchain_url: process.env.DOCCHAIN_URL || configuredUrl || "",
     docchain_api_key: process.env.DOCCHAIN_API_KEY || key || "",
     topicIds: environment && Array.isArray(environment.topics) ? environment.topics.map((topic) => topic.id) : [],
+    neo4j: {
+      uri: process.env.NEO4J_URI || readField(config, "neo4j_uri") || "",
+      user: process.env.NEO4J_USER || readField(config, "neo4j_user") || "neo4j",
+      password: process.env.NEO4J_PASSWORD || readField(config, "neo4j_password") || "",
+      database: process.env.NEO4J_DATABASE || readField(config, "neo4j_database") || "neo4j",
+    },
     vision: {
       url: process.env.VISION_BASE_URL || readField(config, "docchain_vision_url") || DEFAULT_VISION_URL,
       model: process.env.VISION_MODEL || readField(config, "docchain_vision_model") || DEFAULT_VISION_MODEL,
@@ -582,6 +596,23 @@ async function resolveToolServiceConfig(ctx, config) {
         Number(process.env.VISION_MAX_DESC_CHARS || readField(config, "docchain_vision_max_desc_chars")) || undefined,
       key: visionKey,
       keyRef: visionRef,
+    },
+  };
+}
+
+/**
+ * Resolve the KG tool config (Neo4j credentials + DocChain service) from the
+ * same row config the document tools use, so a single settings write feeds both.
+ *
+ * @returns {Promise<{ neo4j: { uri: string, user: string, password: string, database: string }, docchain: { url: string, apiKey: string } }>}
+ */
+async function resolveKgServiceConfig(ctx, config) {
+  const svc = await resolveToolServiceConfig(ctx, config);
+  return {
+    neo4j: svc.neo4j,
+    docchain: {
+      url: svc.docchain_url,
+      apiKey: svc.docchain_api_key,
     },
   };
 }
@@ -795,6 +826,7 @@ export function apply(ctx, config) {
   // provider, the projection file and the configuration page instead of
   // deactivating this plugin entirely.
   let disposeTools;
+  let disposeKgTools;
   ctx.inject(["tools"], (scope) => {
     scope.effect(() => {
       try {
@@ -806,6 +838,16 @@ export function apply(ctx, config) {
         return () => {};
       }
     }, "dsh-docchain: native tools");
+    scope.effect(() => {
+      try {
+        const dispose = registerKgTools(scope, () => resolveKgServiceConfig(ctx, config));
+        if (typeof dispose === "function") disposeKgTools = dispose;
+        return dispose;
+      } catch (error) {
+        scope.logger?.warn?.(`dsh-docchain: cannot register KG tools: ${error?.message ?? error}`);
+        return () => {};
+      }
+    }, "dsh-docchain: kg tools");
   });
   return () => {
     try {
@@ -816,6 +858,11 @@ export function apply(ctx, config) {
     }
     try {
       disposeTools?.();
+    } catch {
+      // already disposed
+    }
+    try {
+      disposeKgTools?.();
     } catch {
       // already disposed
     }

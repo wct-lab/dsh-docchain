@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Docchain",
-    "description": "知识库和文档转换插件：文件名/内容/元数据搜索、主题查询、文档批量上传、文档转 Markdown 解析、图搜图、可切换的 docchain 环境与按环境预选主题，以及深度研究工作流。"
+    "title": "DocChain 文档与知识图谱",
+    "description": "DocChain 文档检索/上传/转换/图片描述与深度研究，以及知识图谱（Neo4j）：查本体结构、执行只读 Cypher、增删改节点与关系走 DocChain API；列文档、检索实体、查看子图直连 Neo4j。支持可切换的 docchain 环境与按环境预选主题。"
   }
 }
