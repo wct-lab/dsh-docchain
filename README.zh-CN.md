@@ -17,7 +17,7 @@
 | `docchain_meta_search` | 按自定义元数据字段筛选文档（字符串/数值/时间，AND / OR 组） |
 | `docchain_upload` | 把文件或文件夹（仅顶层）批量上传到指定主题 |
 | `docchain_image_search` | 图搜图：用本地图片检索相似图片 |
-| `docchain_image_describe` | 文档图片转文字：逐张生成中文描述并写成旁路描述 md |
+| `docchain_image_describe` | 文档图片转文字：逐张生成中文描述（流程图改出 PlantUML 草图）并写成旁路描述 md |
 | `doc2markdown` | 把 docx/doc/pdf/pptx/xlsx/图片等解析为 Markdown |
 | `docchain_kg_schema` | 查主题本体结构（实体类型含属性 + 关系类型），走 DocChain API |
 | `docchain_kg_cypher` | 在主题知识图谱执行只读 Cypher，走 DocChain API |
@@ -36,7 +36,7 @@
 | `docchain-upload` | SKILL.md + Node.js 脚本 | 把本地文件或整个文件夹批量上传到指定 docchain 主题（工具 `docchain_upload`） |
 | `doc2markdown` | SKILL.md + Node.js 脚本 | 把 docx/doc/pdf/pptx/xlsx/图片等常见格式解析为 Markdown（工具 `doc2markdown`） |
 | `docchain-image-search` | SKILL.md + Node.js 脚本 | 图搜图：给一张图，找库里相似的图片（工具 `docchain_image_search`） |
-| `docchain-image-describe` | SKILL.md + Node.js 脚本 | 文档图片转文字：逐张图片生成中文描述并写成旁路描述 md，主 md 不动（工具 `docchain_image_describe`） |
+| `docchain-image-describe` | SKILL.md + Node.js 脚本 | 文档图片转文字：逐张图片生成中文描述（流程图/架构图改出 PlantUML 草图）并写成旁路描述 md，主 md 不动（工具 `docchain_image_describe`） |
 | `deep-research-advanced` | 仅 SKILL.md | 主控式多子智能体深度研究工作流（纯指令，无脚本、无工具） |
 | `docchain-kg` | 仅 SKILL.md | DocChain 知识图谱：查本体/执行 Cypher/写操作，全部走 DocChain API（工具 `docchain_kg_*`） |
 
@@ -292,7 +292,9 @@ Bundle 插入一个 Host 插件（`dsh-docchain`），激活时在 `ctx.skills` 
 
 ### docchain-image-describe（文档图片转文字）
 
-把文档里的图片转成文字：读文档主 md → 逐张图片交给多模态模型生成中文描述 → 在每张图片上方插入 `<!-- image-desc: … -->` → 写成该文档的**旁路描述 md**。
+把文档里的图片转成文字：读文档主 md → 逐张图片交给多模态模型 → 普通图片在图片上方插入 `<!-- image-desc: … -->` 中文描述 → 写成该文档的**旁路描述 md**。
+
+**流程图/架构图这类结构图走另一条路**：模型只回答「节点 + 边」的数据，由脚本按固定模板渲染成一段 `plantuml` 草图，放在本该是描述的位置。模型不写 PlantUML 语法（语法由脚本生成，所以一定合法）；照片、界面截图、曲线图、表格仍然写中文描述。
 
 **主 md 一字不动**：描述存在独立文件里，用 `GET /v1/doc/read?doc_id=<id>&read_format=image_description_md` 读回。因此普通阅读行为不受影响，chat-agent 需要图片语义时才读这份旁路文件。
 
@@ -306,7 +308,16 @@ Bundle 插入一个 Host 插件（`dsh-docchain`），激活时在 `ctx.skills` 
 
 需要注意：
 
-- **时间**：描述按"信息密度"生成（平均约 350–400 字符），单张约 8–12 秒；185 张图、并发 8 约 **4–6 分钟**。建议先 `max_images: 2` 试跑估时；
+- **时间**：描述按"信息密度"生成（平均约 350–400 字符），单张约 8–12 秒。结构图那张要**3 次调用**（分类 + 主读 + 复核），约 25–50 秒；描述图 **2 次**（分类 + 描述）。9 张图实测 1–4 分钟（网关波动大）。建议先 `max_images: 2` 试跑估时；
+- **先分类再执行**：每张图先单独问一次「该出结构还是该写描述」，只让它回答一个词。判据是"图里的**连接线**是否承载信息"：有连线、且去掉连线关系就没了 → 结构；靠色块/分栏/竖排标注表达的版式信息图、方框之间没有连线的并列表 → 描述（哪怕看起来有很多方框）。结果里 `diagram.structured` / `diagram.as_prose` 是两个分类计数，`diagram.suspect` 是"判成描述但回答里又出现图数据"、被补问过一次的张数，`diagram.annotation_guard` 是"判成结构但节点多是版面标注"、被兜底退回描述的张数；
+- **产物形态（两种图统一）**：结构图 → 一段 `plantuml` 代码块；其它图 → 一段中文描述注释。**无论哪种，原图都不再嵌进正文**，统一改成一行 `[原图](地址)` 链接，需要对照时点开；
+- **可疑复核**：判成"描述"、但那次回答里出现了图数据签名 `"nodes":` 时，会补问一次结构提示词，能出图就改判为图；平时刻意不做，避免每张都多花一次调用。实测两篇文档 14 张图里触发 0 次；
+- **两遍读图**：结构图用主模型读一遍、复核模型再读一遍，只删两家**方向相反**的边（其余保留）；`docchain_vision_judge_model` 传空串可关掉，省一半调用；
+- **规模**：单张最多 **28 节点 / 48 条边**；渲染后超过 **860 字符**会裁剪。裁剪只删"有父节点、没有子节点"的叶子，且**优先删最深的** —— 顶层并排的部门一个都不会少（早先的按顺序截断曾把整列部门切掉）；
+- **版式图兜底**：即使判成结构图，只要"节点名"里 ≥3 个且 ≥25% 是版面标注（含句读 `：，。；、` 或分层间隔号 `·`），就退回描述（计 `diagram.annotation_guard`）。省略号 `…` 不算证据——那是截断长名字的痕迹，拿它判会误伤正常架构图；
+- **叠层清理**：主 md 里若有旧 `image-desc` 注释，生成时先剥掉再写本次结果，不会出现"同一张图既像草图又像注释"；
+- **清噪**：1–2 位序号、纯符号、`L×/N×/×N` 这类重复次数会被丢掉；`4096`、`224×224×3` 这类真实层宽/尺寸保留；同名且**邻居完全一致**的重复节点会合并（`512→512→512` 这类同名长链不合并）；
+- **草图不是还原**：所有结构图统一画成"带标签的方框 + 箭头"**竖排**，时序图不会画成"参与者 + 消息"那种标准时序图；数据不可用时先补一次纯描述（`diagram.prose_retry`），补不到才记失败；
 - **精度优先**：提示词要求专有名词/字段名/单位/数值/公式**照抄原文**，同时删掉纯装饰描述（圆角、线条、填充）与重复句 —— 实测比"完整还原"版短 57%，信息量反而更高；
 - **长度**：单条上限默认 **2000** 字符（`docchain_vision_max_desc_chars` 可调）；超长时**先让模型压缩**（保留名称/数值/公式，删修饰语），压不下来才按句末截断。结果里三个计数要分清：`compressed`（走了压缩）、`truncated`（最终仍被砍）、`incomplete`（撞上 max_tokens，内容停在半句）—— **后两者不为 0 才说明真的丢信息**；
 - **并发**：8 是实测最优点（12 起被网关限流 429，3/4 反而更慢）；
@@ -314,17 +325,19 @@ Bundle 插入一个 Host 插件（`dsh-docchain`），激活时在 `ctx.skills` 
 - **体积**：185 张图的描述 md 约 1.4 MB；>400 张图会提示 `LARGE_PAYLOAD`；
 - **描述是模型读图的结果**，密集表格与公式可能误读，关键数据请回看原图。
 
-**视觉模型配置**：默认 `https://lab.iwhalecloud.com/gpt-proxy/v1` + `qwen3-vl-plus`，Key 取凭据库的 `IWHALE_API_KEY`。要换模型/地址/长度上限，改这几个字段（配置页不渲染输入框，改设置文档即可）：
+**视觉模型配置**：默认 `https://lab.iwhalecloud.com/gpt-proxy/v1` + `doubao-seed-2.0-pro`（主）+ `qwen3-vl-plus`（复核），Key 取凭据库的 `IWHALE_API_KEY`。要换模型/地址/长度上限，改这几个字段（配置页不渲染输入框，改设置文档即可）：
 
 ```yaml
 docchain_vision_url: https://lab.iwhalecloud.com/gpt-proxy/v1
-docchain_vision_model: qwen3-vl-plus
+docchain_vision_model: doubao-seed-2.0-pro         # 主模型：读图 + 写描述
+docchain_vision_judge_model: qwen3-vl-plus          # 复核模型：结构图读第二遍，只删方向矛盾的边；留空=只读一遍
 docchain_vision_fallback_model: g-deepseek-v4-flash   # 主模型不可用时自动降级一次
 docchain_vision_key_ref: IWHALE_API_KEY               # 凭据引用名
 docchain_vision_max_desc_chars: 1200                  # 单条描述字数上限（超出按句末截断）
+docchain_vision_diagram: on                           # 结构图输出 plantuml 草图；off = 全部只写描述
 ```
 
-CLI 用环境变量：`VISION_BASE_URL` / `VISION_MODEL` / `VISION_API_KEY` / `VISION_MAX_DESC_CHARS`。用 `list_models` 可以先看这把 key 到底能用哪些视觉模型。
+CLI 用环境变量：`VISION_BASE_URL` / `VISION_MODEL` / `VISION_JUDGE_MODEL` / `VISION_FALLBACK_MODEL` / `VISION_API_KEY` / `VISION_MAX_DESC_CHARS` / `VISION_DIAGRAM`。用 `list_models` 可以先看这把 key 到底能用哪些视觉模型。
 
 ### deep-research-advanced（高级深度研究）
 

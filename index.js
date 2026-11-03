@@ -80,6 +80,13 @@ export const DEFAULT_VISION_MODEL = "qwen3-vl-plus";
 export const DEFAULT_VISION_FALLBACK_MODEL = "g-deepseek-v4-flash";
 /** Default cap on one description (characters); keeps one image = one line. */
 export const DEFAULT_VISION_MAX_DESC_CHARS = 1200;
+/**
+ * Default behaviour for structure-like images (flowcharts, architecture diagrams).
+ *
+ * "on" lets the model answer with a node/edge graph instead of prose, which the
+ * script then renders as a PlantUML sketch; "off" restores pure descriptions.
+ */
+export const DEFAULT_VISION_DIAGRAM = "on";
 
 /**
  * Row config schema — a schemastery schema, the host's native config library.
@@ -127,6 +134,18 @@ export const Config = z.object({
     .volatile()
     .description(
       `单条描述的字数上限，默认 ${DEFAULT_VISION_MAX_DESC_CHARS}；超出部分按句末截断，并在结果里计入 truncated`,
+    ),
+  docchain_vision_diagram: z
+    .string()
+    .volatile()
+    .description(
+      `流程图/架构图这类结构图是否改出 PlantUML 草图，取值 on / off，默认 ${DEFAULT_VISION_DIAGRAM}；on 时结构图出草图、其它图仍写描述注释，off 时全部图片都只写描述注释`,
+    ),
+  docchain_vision_judge_model: z
+    .string()
+    .volatile()
+    .description(
+      '结构图的复核模型：同一张图读两遍，只删掉两边方向相反的连线、其余保留。默认 doubao-seed-2.0-pro；留空表示只读一遍',
     ),
   neo4j_uri: z
     .string()
@@ -526,6 +545,10 @@ async function materializeServiceConfig(ctx, config) {
   if (visionModel) next.docchain_vision_model = visionModel;
   if (visionFallback) next.docchain_vision_fallback_model = visionFallback;
   if (visionMaxChars) next.docchain_vision_max_desc_chars = visionMaxChars;
+  const visionDiagram = readField(config, "docchain_vision_diagram");
+  if (visionDiagram) next.docchain_vision_diagram = visionDiagram;
+  const visionJudge = readField(config, "docchain_vision_judge_model");
+  if (visionJudge) next.docchain_vision_judge_model = visionJudge;
   const rendered = `${JSON.stringify(next, null, 2)}\n`;
   if (current === rendered) return; // unchanged; no rewrite, no log
   try {
@@ -594,6 +617,13 @@ async function resolveToolServiceConfig(ctx, config) {
       // 否则两处常量会漂移（实测 index.js 的 1200 覆盖了脚本里的 1500）。
       maxDescChars:
         Number(process.env.VISION_MAX_DESC_CHARS || readField(config, "docchain_vision_max_desc_chars")) || undefined,
+      // 结构图开关：同样不填默认值，默认值只有一处（脚本里的 DEFAULT_DIAGRAM_MODE）。
+      diagram: process.env.VISION_DIAGRAM || readField(config, "docchain_vision_diagram") || undefined,
+      // 复核模型：env 显式设成空串等于关闭（undefined 才会落到脚本里的默认值）。
+      judgeModel:
+        process.env.VISION_JUDGE_MODEL !== undefined
+          ? process.env.VISION_JUDGE_MODEL
+          : readField(config, "docchain_vision_judge_model") || undefined,
       key: visionKey,
       keyRef: visionRef,
     },

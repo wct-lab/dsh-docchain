@@ -19,7 +19,7 @@ const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 
 
 /** 起一个假服务：`ignoreFlag` 为真时模拟"服务端把描述写进了主 md"。 */
 function startStub(options) {
-  const state = { mainMd: '', descMd: null, saves: [] };
+  const state = { mainMd: '', descMd: null, saves: [], chatCalls: 0, lastPrompt: '' };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const send = (status, body, type) => {
@@ -38,6 +38,29 @@ function startStub(options) {
       req.on('end', () => {
         // 带图片的调用 = 描述；不带图片的调用 = 压缩（completeText）
         const hasImage = raw.includes('"image_url"');
+        state.chatCalls += 1;
+        try {
+          const body = JSON.parse(raw);
+          const parts = body && body.messages && body.messages[0] ? body.messages[0].content : [];
+          const textPart = Array.isArray(parts) ? parts.find((part) => part && part.type === 'text') : null;
+          state.lastPrompt = textPart ? String(textPart.text || '') : '';
+        } catch {
+          state.lastPrompt = '';
+        }
+        // 分类调用：提示词里带 STRUCTURE / PROSE 字样，只回一个词
+        if (hasImage && state.lastPrompt.includes('STRUCTURE')) {
+          const kind = options.kindText || 'STRUCTURE';
+          send(200, JSON.stringify({ choices: [{ message: { content: kind }, finish_reason: 'stop' }] }));
+          return;
+        }
+        // 结构数据不可用时会用"纯描述"提示词补一次：靠"二选一"这个字样区分两种提示词
+        if (options.proseOnRetry && hasImage && !state.lastPrompt.includes('二选一')) {
+          send(
+            200,
+            JSON.stringify({ choices: [{ message: { content: options.proseOnRetry }, finish_reason: 'stop' }] }),
+          );
+          return;
+        }
         const content = !hasImage && options.compressTo ? options.compressTo : options.descText || '一张展示损失下降的折线图。';
         send(
           200,
@@ -137,9 +160,10 @@ test('服务端正确写旁路文件时，保存成功且读回校验通过、�
     assert.strictEqual(doc.saved.ok, true);
     assert.strictEqual(doc.saved.verified, true);
     assert.ok(doc.saved.bytes > 0);
-    // 描述确实插在图片上方，且是合法注释
+    // 描述确实插在图片位置，且是合法注释；原图换成「原图」链接
     assert.ok(stub.state.descMd.includes('<!-- image-desc: 一张展示损失下降的折线图。 -->'));
-    assert.ok(stub.state.descMd.includes('![image](http://'));
+    assert.ok(stub.state.descMd.includes('[原图](http://'));
+    assert.ok(!stub.state.descMd.includes('![image]'), '原图不该再嵌进正文');
   } finally {
     stub.server.close();
   }
@@ -249,6 +273,188 @@ test('dry_run 不调用保存接口', async () => {
     assert.strictEqual(stub.state.saves.length, 0);
     assert.deepStrictEqual(doc.saved, { ok: false, error: 'DRY_RUN' });
     assert.ok(doc.preview_head.length > 0);
+  } finally {
+    stub.server.close();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * 结构图（A 类）：模型给「节点/边」数据，代码生成 PlantUML
+ * ------------------------------------------------------------------ */
+
+const GRAPH_JSON = JSON.stringify({
+  title: 'BPE 学习流程',
+  nodes: [
+    { id: 'n1', label: '词表' },
+    { id: 'n2', label: '统计二元组' },
+    { id: 'n3', label: '符号合并表' },
+  ],
+  edges: [
+    { from: 'n1', to: 'n2', label: '统计二元组' },
+    { from: 'n2', to: 'n3', label: '合并(e,s)' },
+    { from: 'n3', to: 'n1', label: '更新词表' },
+  ],
+});
+
+test('结构图：保存的 md 里是隐藏的结构注释，且这张图没有描述注释', async () => {
+  const stub = await startStub({ ignoreFlag: false, descText: GRAPH_JSON });
+  try {
+    const before = stub.state.mainMd;
+    const payload = await mod.runDescribeImages(configFor(stub), { docIds: [1], quiet: true });
+    const doc = payload.documents[0];
+    const md = stub.state.descMd;
+
+    assert.strictEqual(doc.diagram.rendered, 1);
+    assert.strictEqual(doc.diagram.fallback, 0);
+    assert.strictEqual(doc.diagram.nodes, 3);
+    assert.strictEqual(doc.diagram.edges, 3);
+    assert.strictEqual(doc.saved.verified, true);
+    assert.strictEqual(stub.state.mainMd, before, '主 md 不应被改动');
+
+    assert.ok(md.includes('```plantuml'), md);
+    assert.ok(md.includes('@startuml') && md.includes('@enduml'));
+    assert.ok(md.includes('title BPE 学习流程'));
+    assert.ok(md.includes('rectangle "词表" as n1'));
+    assert.ok(md.includes('n1 --> n2 : 统计二元组'));
+    assert.ok(!md.includes('image-desc'), '结构图不该再留描述注释');
+    // 有草图 → 原图不再嵌入，只剩一行可点链接
+    assert.ok(!md.includes('![image]'), '有草图的原图不该再嵌入');
+    assert.ok(md.includes('[原图](http'), '应保留原图地址链接');
+    assert.ok(md.indexOf('```plantuml') < md.indexOf('[原图]'), '草图在链接上方');
+    // 配对：一块草图 = 一个 ```plantuml 开 + 一个 ``` 收
+    assert.strictEqual((md.match(/```plantuml/g) || []).length, 1);
+    assert.strictEqual((md.match(/^```$/gm) || []).length, 1);
+  } finally {
+    stub.server.close();
+  }
+});
+
+test('结构图：分类 1 次 + 主读 1 次 + 复核 1 次，只保留两边一致的连线', async () => {
+  const stub = await startStub({ ignoreFlag: false, descText: GRAPH_JSON });
+  try {
+    const payload = await mod.runDescribeImages(configFor(stub), { docIds: [1], judgeModel: 'judge-m', quiet: true });
+    const doc = payload.documents[0];
+    assert.strictEqual(stub.state.chatCalls, 3, `实际发了 ${stub.state.chatCalls} 次请求（分类+主读+复核）`);
+    assert.strictEqual(doc.diagram.structured, 1, '应记 1 张判为结构图');
+    assert.strictEqual(doc.diagram.dual, 1);
+    assert.strictEqual(doc.diagram.agreed, 1, '两侧一致时交集应可用');
+    assert.strictEqual(doc.diagram.rendered, 1);
+  } finally {
+    stub.server.close();
+  }
+});
+
+test('结构图：judgeModel 置空时不跑复核（省一次调用）', async () => {
+  const stub = await startStub({ ignoreFlag: false, descText: GRAPH_JSON });
+  try {
+    const payload = await mod.runDescribeImages(configFor(stub), { docIds: [1], judgeModel: '', quiet: true });
+    const doc = payload.documents[0];
+    assert.strictEqual(stub.state.chatCalls, 2, '分类 + 主读，共 2 次');
+    assert.strictEqual(doc.diagram.dual, 0);
+    assert.strictEqual(doc.diagram.rendered, 1);
+  } finally {
+    stub.server.close();
+  }
+});
+
+test('判为"写描述"的图不发结构提示词，直接出注释', async () => {
+  const stub = await startStub({ ignoreFlag: false, descText: '一张海报式的分层信息图，含多个色块分区。', kindText: 'PROSE' });
+  try {
+    const payload = await mod.runDescribeImages(configFor(stub), { docIds: [1], judgeModel: '', quiet: true });
+    const doc = payload.documents[0];
+    assert.strictEqual(doc.diagram.structured, 0);
+    assert.strictEqual(doc.diagram.as_prose, 1);
+    assert.strictEqual(doc.diagram.rendered, 0, '判为描述就不该出草图');
+    assert.ok(stub.state.descMd.includes('<!-- image-desc: 一张海报式'), stub.state.descMd);
+    assert.ok(!stub.state.descMd.includes('```plantuml'), '不该出现草图围栏');
+  } finally {
+    stub.server.close();
+  }
+});
+
+test('图数据不可用但还有文字：回退成描述注释，并如实记 fallback', async () => {
+  const tinyGraph =
+    '这是一张流程图。{"nodes":[{"id":"n1","label":"a"},{"id":"n2","label":"b"}],"edges":[{"from":"n1","to":"n2"}]}';
+  const stub = await startStub({ ignoreFlag: false, descText: tinyGraph });
+  try {
+    const payload = await mod.runDescribeImages(configFor(stub), { docIds: [1], quiet: true });
+    const doc = payload.documents[0];
+    const md = stub.state.descMd;
+
+    assert.strictEqual(doc.diagram.rendered, 0);
+    assert.strictEqual(doc.diagram.fallback, 1);
+    assert.ok(!md.includes('```plantuml'), '不该画出半成品草图');
+    assert.ok(md.includes('<!-- image-desc: 这是一张流程图。 -->'), md);
+    assert.ok(!md.includes('"nodes"'), 'JSON 不能漏进注释');
+    assert.ok(doc.warnings.some((w) => w.startsWith('DIAGRAM_FALLBACK')), JSON.stringify(doc.warnings));
+    assert.strictEqual(doc.saved.verified, true);
+  } finally {
+    stub.server.close();
+  }
+});
+
+test('图数据不可用又没有文字：不把半截 JSON 写进注释（整体 ALL_FAILED）', async () => {
+  const noProse = '{"nodes":[{"id":"n1","label":"a"},{"id":"n2","label":"b"}],"edges":[{"from":"n1","to":"n2"}]}';
+  const stub = await startStub({ ignoreFlag: false, descText: noProse });
+  try {
+    await assert.rejects(
+      () => mod.runDescribeImages(configFor(stub), { docIds: [1], quiet: true }),
+      (error) => {
+        assert.strictEqual(error.code, 'ALL_FAILED');
+        return true;
+      },
+    );
+    assert.strictEqual(stub.state.saves.length, 0, '没东西可存就不该调保存');
+  } finally {
+    stub.server.close();
+  }
+});
+
+test('结构数据不可用时会补一次"纯描述"，保证每张图都有产出', async () => {
+  const tinyGraph = '{"nodes":[{"id":"n1","label":"a"},{"id":"n2","label":"b"}],"edges":[{"from":"n1","to":"n2"}]}';
+  const stub = await startStub({
+    ignoreFlag: false,
+    descText: tinyGraph,
+    proseOnRetry: '一张组织架构图，含战略运营部与品牌运营部两个部门。',
+  });
+  try {
+    const payload = await mod.runDescribeImages(configFor(stub), { docIds: [1], judgeModel: '', quiet: true });
+    const doc = payload.documents[0];
+    assert.strictEqual(doc.diagram.rendered, 0);
+    assert.strictEqual(doc.diagram.prose_retry, 1, '应该记一次"补描述"');
+    assert.strictEqual(doc.described, 1, '补到的描述要算进 described');
+    assert.ok(stub.state.descMd.includes('<!-- image-desc: 一张组织架构图'), stub.state.descMd);
+    assert.strictEqual(doc.saved.verified, true);
+  } finally {
+    stub.server.close();
+  }
+});
+
+test('diagram=off：只发一次纯描述请求，产物与旧行为一致', async () => {
+  const stub = await startStub({ ignoreFlag: false, descText: '一张展示损失下降的折线图。' });
+  try {
+    const payload = await mod.runDescribeImages(configFor(stub), { docIds: [1], diagram: 'off', quiet: true });
+    const doc = payload.documents[0];
+    assert.strictEqual(doc.diagram.mode, 'off');
+    assert.strictEqual(doc.diagram.rendered, 0);
+    assert.strictEqual(stub.state.chatCalls, 1);
+    assert.ok(!stub.state.lastPrompt.includes('A. 结构图'), '关闭后不该再给二选一提示词');
+    assert.ok(stub.state.descMd.includes('<!-- image-desc: 一张展示损失下降的折线图。 -->'));
+    assert.ok(!stub.state.descMd.includes('```plantuml'));
+    assert.ok(!doc.warnings.some((w) => w.startsWith('DIAGRAM_NONE')), '关闭时不该报 DIAGRAM_NONE');
+  } finally {
+    stub.server.close();
+  }
+});
+
+test('普通描述不会误入结构图分支（模型都按描述回答时记 DIAGRAM_NONE）', async () => {
+  const stub = await startStub({ ignoreFlag: false });
+  try {
+    const payload = await mod.runDescribeImages(configFor(stub), { docIds: [1], quiet: true });
+    const doc = payload.documents[0];
+    assert.strictEqual(doc.diagram.rendered, 0);
+    assert.strictEqual(doc.diagram.fallback, 0, '普通描述不该被算成回退');
+    assert.ok(doc.warnings.some((w) => w.startsWith('DIAGRAM_NONE')), JSON.stringify(doc.warnings));
   } finally {
     stub.server.close();
   }

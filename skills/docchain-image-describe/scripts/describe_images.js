@@ -61,6 +61,79 @@ const DESC_SUFFIX = ' -->';
 const DESC_MAX_CHARS = 2000;
 /** 视觉模型单次输出的 token 上限；中文约 1 字 1 token，1200 字留足余量。 */
 const DESC_MAX_TOKENS = 2600;
+
+/**
+ * 结构图（A 类图片）开关：`on` 时让模型二选一输出「节点/边」数据，由本文件的
+ * 模板函数渲染成 PlantUML；`off` 时回到纯描述提示词。
+ *
+ * 为什么不是模型直接写 PlantUML：实测它会把别名用到声明之前（`T1 -[hidden]-> T2`
+ * 之后才 `[T2] as T2`）、照写 skinparam，还夹带前言与结尾反问。语法只要写错一个
+ * 字符整段就是废的。让模型只产出「谁连着谁」的数据、语法由代码拼，才能保证合法。
+ */
+const DIAGRAM_MODES = ['off', 'on'];
+const DEFAULT_DIAGRAM_MODE = 'on';
+/**
+ * 节点/边/标签上限：只做"防爆"用，不做"提炼"用。
+ *
+ * 早期为了图小，把上限压到 12 节点 / 16 字 / 扇出 5，结果是把原图的结构砍掉一半
+ * （实测 VGG19 的三层 4096 全丢、N 层堆叠被合并成一个模块），看起来就像"模型在总结"。
+ * 现在放宽到接近提示词给的上限：宁可图大，不可失真。
+ */
+const DIAGRAM_MAX_NODES = 28;
+const DIAGRAM_MAX_EDGES = 48;
+const DIAGRAM_MAX_LABEL_CHARS = 28;
+/** 一个节点最多画几条出边：只挡"放射状糊成一团"的极端情况。 */
+const DIAGRAM_MAX_FANOUT = 8;
+/** 纯符号（不含 +，加法节点是真实结构）。 */
+const NOISE_LABEL = /^[\s.,;:*\-–—=/\\×()（）%#_]+$/;
+
+/**
+ * 是否"不是模块"的标签。
+ *
+ * 只挡确定是编号/标注的东西：1–2 位序号（0…9）、纯符号、以及 L×、Nv×、×N 这类
+ * "重复多少次"的重复次数标注。**不再**一刀切掉所有纯数字 —— `4096`、`224` 是真实的
+ * 层宽/尺寸，丢掉就少了一层结构。
+ */
+function isNoiseLabel(text) {
+    const value = String(text == null ? '' : text).trim();
+    if (!value) return true;
+    if (/^\d{1,2}$/.test(value)) return true;
+    if (/^[A-Za-z]{0,3}\s*[×xX]$/.test(value)) return true;
+    if (/^[×xX]\s*[Nn]$/.test(value)) return true;
+    return NOISE_LABEL.test(value);
+}
+/** 低于这个规模不认作结构图：单链条、散点、纯文字截图都会被这条筛回描述路径。 */
+const DIAGRAM_MIN_NODES = 3;
+const DIAGRAM_MIN_EDGES = 2;
+/**
+ * 结构图那次调用的 token 上限：要输出 20 个节点 + 40 条边的 JSON，比一段描述长得多。
+ * 撞上限会被截断成半个 JSON，而半个 JSON 只能回退成散文 —— 所以给足余量。
+ */
+const DIAGRAM_MAX_TOKENS = 3200;
+/**
+ * 草图的落盘方式：```plantuml 代码围栏。
+ *
+ * 这是**实测唯一能让人看到草图**的写法：平台的渲染器会把围栏渲染成真的方框图。
+ * 其它写法都试过、都失败：
+ *   - `<details>` 折叠：标签被当原文再显示一遍、折叠不生效，而且它之后的行不再按
+ *     markdown 解析，图片退化成 `![image](...)` 裸文本；
+ *   - HTML 注释（多行或单行）：被当作灰底代码块直接显示出来，既不隐身也不成图。
+ * 所以"隐藏/折叠"属于查看器的能力，内容侧只负责给出围栏。
+ */
+const DIAGRAM_FENCE = '```plantuml';
+const DIAGRAM_FENCE_END = '```';
+/**
+ * 有草图时，原图不再嵌入正文，改成这一行链接：`[原图](地址)`。
+ *
+ * 为什么：原图和草图表达的是同一个结构，两张都铺在正文里太占版面；但直接删掉又没法
+ * 回头核对（"得保证和原图一致"），所以保留可点开的地址。
+ */
+const DIAGRAM_IMAGE_LINK_PREFIX = '[原图](';
+
+/** 这条结果是不是"有草图"。 */
+function hasSketch(entry) {
+    return Boolean(entry && typeof entry === 'object' && entry.puml);
+}
 /** 描述文件未生成时服务端返回的哨兵串；不是 404。 */
 const SENTINEL = 'Image description markdown file not found...';
 const SENTINEL_BYTES = Buffer.byteLength(SENTINEL);
@@ -88,6 +161,11 @@ vision_api_key: 视觉模型网关的 Key（工具路径从凭据库 IWHALE_API_
 const DEFAULT_VISION_URL = 'https://lab.iwhalecloud.com/gpt-proxy/v1';
 const DEFAULT_VISION_MODEL = 'qwen3-vl-plus';
 const DEFAULT_VISION_FALLBACK = 'g-deepseek-v4-flash';
+/**
+ * 复核模型：结构图读两遍（主模型 + 这个模型），只保留两边都认可的连线。
+ * 实测不同模型的读图错误不重叠（qwen 读错输入合并、doubao 读错反向层），交集能压掉编造的边。
+ */
+const DEFAULT_VISION_JUDGE_MODEL = 'doubao-seed-2.0-pro';
 
 const ARG_SPEC = {
     doc_ids: { type: 'string', default: null },
@@ -96,6 +174,7 @@ const ARG_SPEC = {
     'max-images': { type: 'int', default: DEFAULT_MAX_IMAGES },
     concurrency: { type: 'int', default: DEFAULT_CONCURRENCY },
     model: { type: 'string', default: null },
+    diagram: { type: 'string', default: null },
     'dry-run': { type: 'flag', flag: true, default: false },
     'list-models': { type: 'flag', flag: true, default: false },
     read: { type: 'flag', flag: true, default: false },
@@ -103,7 +182,7 @@ const ARG_SPEC = {
 };
 
 const USAGE = `用法：
-  node scripts/describe_images.js --doc_ids 125755 [--max-images 2] [--dry-run]
+  node scripts/describe_images.js --doc_ids 125755 [--max-images 2] [--dry-run] [--diagram off]
   node scripts/describe_images.js --keyword 大语言模型 [--topic_ids 10904]
   node scripts/describe_images.js --doc_ids 125755,125676 --confirm
   node scripts/describe_images.js --list-models
@@ -221,10 +300,21 @@ function getConfig() {
         topicIds,
         topicNames,
         vision: {
-            url: String(config.docchain_vision_url || DEFAULT_VISION_URL).replace(/\/+$/, ''),
-            model: String(config.docchain_vision_model || DEFAULT_VISION_MODEL),
-            fallbackModel: String(config.docchain_vision_fallback_model || DEFAULT_VISION_FALLBACK),
-            maxDescChars: Number(config.docchain_vision_max_desc_chars) || undefined,
+            // 环境变量必须排最前：早先这里直接用 config 值（缺省已填成默认模型），
+            // 把 VISION_MODEL 遮住了 —— CLI 明明设了环境变量，跑的却是默认模型。
+            url: String(process.env.VISION_BASE_URL || config.docchain_vision_url || DEFAULT_VISION_URL).replace(
+                /\/+$/,
+                '',
+            ),
+            model: String(process.env.VISION_MODEL || config.docchain_vision_model || DEFAULT_VISION_MODEL),
+            fallbackModel: String(
+                process.env.VISION_FALLBACK_MODEL || config.docchain_vision_fallback_model || DEFAULT_VISION_FALLBACK,
+            ),
+            judgeModel: String(
+                process.env.VISION_JUDGE_MODEL || config.docchain_vision_judge_model || DEFAULT_VISION_JUDGE_MODEL,
+            ),
+            maxDescChars:
+                Number(process.env.VISION_MAX_DESC_CHARS || config.docchain_vision_max_desc_chars) || undefined,
             // 凭据库不从这里读：CLI 走环境变量，工具路径由宿主解析后传入。
             key: process.env.VISION_API_KEY || String(config.vision_api_key || ''),
         },
@@ -376,6 +466,10 @@ function sanitizeDesc(text, maxChars) {
     const limit = Number.isInteger(maxChars) && maxChars > 0 ? maxChars : DESC_MAX_CHARS;
     let value = String(text || '').replace(/\s+/g, ' ').trim();
     if (!value) return '';
+    // 模型偶尔会把提示词里的分支编号一起抄出来（"B. 六个子图并列排布…"），
+    // 那个 "B." 是给模型看的分支标签，不是描述内容，留着会让每张图都以字母开头。
+    value = value.replace(/^[ABab][.．、:：)）]\s*(?=\S)/, '').trim();
+    if (!value) return '';
     if (value.length > limit) {
         const head = value.slice(0, limit);
         const cut = lastSentenceEnd(head, Math.floor(limit * 0.5), head.length);
@@ -406,6 +500,469 @@ function buildCompressPrompt(text, limit, ratio) {
         '4. 直接输出压缩后的描述正文，不要解释你做了什么。\n\n' +
         `原文：\n${text}`
     );
+}
+
+/**
+ * 从模型输出里抠出第一个完整的 JSON 对象。
+ *
+ * 实测这个模型不会老实"只输出 JSON"：它会在前面写一段"我理解你的要求"、把 JSON
+ * 包进 ```json 围栏、末尾再问一句"需要吗"。所以不能直接 JSON.parse 整段。
+ * 这里用括号配对扫描（字符串里的花括号与转义正确跳过），既能吃掉外围文字，
+ * 也能识别"被 max_tokens 截断"——没闭合就返回 null，交给调用方回退散文。
+ *
+ * @param {string} text 模型原始输出
+ * @returns {string|null} JSON 文本，或 null（没有 / 不完整）
+ */
+function extractJsonObject(text) {
+    const source = String(text || '');
+    const start = source.indexOf('{');
+    if (start < 0) return null;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < source.length; i += 1) {
+        const ch = source[i];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (ch === '\\') escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+        } else if (ch === '{') {
+            depth += 1;
+        } else if (ch === '}') {
+            depth -= 1;
+            if (depth === 0) return source.slice(start, i + 1);
+        }
+    }
+    return null;
+}
+
+/**
+ * 把「节点/边」JSON 校验成一张能画的图；不可用则返回 null。
+ *
+ * 校验口径比"能否解析"严：边指向不存在的节点直接丢弃（模型常把图里的箭头连到
+ * 它没列出来的框），节点或边太少说明这根本不是结构图（曲线图、纯文字截图），
+ * 一律判 null 让调用方回退成散文描述 —— 宁可少一张草图，不可用废图顶掉好描述。
+ *
+ * @param {string} text 含 JSON 的文本
+ * @returns {{title: string, nodes: Array, edges: Array}|null}
+ */
+function parseGraph(text) {
+    const raw = extractJsonObject(text);
+    if (!raw) return null;
+    let data;
+    try {
+        data = JSON.parse(raw);
+    } catch {
+        return null;
+    }
+    if (!data || typeof data !== 'object') return null;
+
+    const nodes = [];
+    const seen = new Set();
+    // 不再按标签合并：原图里"Add & Norm"、"4096"这类同名框本来就重复出现（N 层堆叠），
+    // 合并会把它压成一个模块 —— 那不是精简，是改意思。宁可多几个框。
+    const idToCanonical = new Map();
+    for (const item of Array.isArray(data.nodes) ? data.nodes : []) {
+        if (!item || typeof item !== 'object') continue;
+        const id = String(item.id == null ? '' : item.id).trim();
+        const rawLabel = String(item.label == null ? '' : item.label)
+            .replace(/\s+/g, ' ')
+            // 模型会把 LaTeX 下标照抄成 X_{t-1}，PlantUML 不解释它，原样画出来很丑；
+            // 去掉花括号变成 X_t-1，短且不丢信息。
+            .replace(/_\{([^{}]*)\}/g, '_$1')
+            .replace(/\^\{([^{}]*)\}/g, '^$1')
+            .trim();
+        if (!id || !rawLabel || seen.has(id)) continue;
+        seen.add(id);
+        // 1–2 位序号、×N、纯符号是图上的编号/标注，不是模块：画出来就是一堆没意义的框。
+        if (isNoiseLabel(rawLabel)) continue;
+        const label =
+            rawLabel.length > DIAGRAM_MAX_LABEL_CHARS ? truncateLabel(rawLabel, DIAGRAM_MAX_LABEL_CHARS) : rawLabel;
+        idToCanonical.set(id, id);
+        nodes.push({ id, label });
+        // 这里**不**按数量截断：早先"够 20 个就 break"会按输入顺序砍掉整列叶子
+        // （实测某张 23 节点的组织图，最右侧的"经营三部 + 三个业务办"整段消失）。
+        // 超限交给 shrinkGraph 按"删最边缘叶子"处理，保证主干完整。
+    }
+
+    const ids = new Set(nodes.map((node) => node.id));
+    const rawEdges = [];
+    for (const item of Array.isArray(data.edges) ? data.edges : []) {
+        if (!item || typeof item !== 'object') continue;
+        const from = String(item.from == null ? '' : item.from).trim();
+        const to = String(item.to == null ? '' : item.to).trim();
+        if (!from || !to) continue;
+        const label = String(item.label == null ? '' : item.label).replace(/\s+/g, ' ').trim();
+        rawEdges.push({ from, to, label });
+    }
+    // 被丢掉的节点（patch 编号那类）要"短路"掉：把它的前驱直接接到它的后继上，
+    // 否则 "Patch Embedding → 0…9 → Encoder" 这种主干会被拆成两截、图就断开了。
+    const rawOut = new Map();
+    for (const edge of rawEdges) {
+        if (!rawOut.has(edge.from)) rawOut.set(edge.from, []);
+        rawOut.get(edge.from).push(edge.to);
+    }
+    const resolveEnds = (id, depth) => {
+        const mapped = idToCanonical.get(id);
+        if (mapped && ids.has(mapped)) return [mapped];
+        if (depth >= 2) return [];
+        const next = rawOut.get(id) || [];
+        // 只有"恰好一个后继"时才短路：被丢掉的若是扇形枢纽（一个父节点连 8 个子公司），
+        // 展开会把兄弟节点两两连成网状假边（实测 6 个节点被连成 30 条边）。
+        if (next.length !== 1) return [];
+        return resolveEnds(next[0], depth + 1);
+    };
+
+    const edges = [];
+    const seenEdge = new Set();
+    const fanoutOf = new Map();
+    for (const edge of rawEdges) {
+        for (const from of resolveEnds(edge.from, 0)) {
+            for (const to of resolveEnds(edge.to, 0)) {
+                if (from === to) continue; // 合并/短路后产生的自环直接丢
+                // 注意：**不能**按"标签相同就不连"过滤 —— 连续的同类模块（VGG19 的三层 4096、
+                // 堆叠的 Add & Norm）本来就走同一条链，按标签删边会把它们整段拆断。
+                const key = `${from}>${to}`;
+                if (seenEdge.has(key)) continue;
+                seenEdge.add(key);
+                // 同一节点扇出太多会画成一团交叉箭头，按上限截断（先到先得）。
+                const fanout = fanoutOf.get(from) || 0;
+                if (fanout >= DIAGRAM_MAX_FANOUT) continue;
+                fanoutOf.set(from, fanout + 1);
+                edges.push({ from, to, label: edge.label });
+            }
+        }
+        // 同理不按数量 break：边也要全部收进来，超限由 shrinkGraph 统一裁。
+    }
+
+    if (nodes.length < DIAGRAM_MIN_NODES || edges.length < DIAGRAM_MIN_EDGES) return null;
+
+    // 先把"同一个框被写成多个 id"的冗余节点合并掉，再生效孤立点过滤：
+    // 否则同名重复节点之间的边会变成自环、重复边，看着就像逻辑错了。
+    const collapsed = mergeRedundantNodes(nodes, edges);
+
+    // 一条边都不沾的节点就是"漂浮的标签"（实测原图的行标题 输入层/正向LSTM 被当成节点），
+    // 它们不承载结构，画出来只会让人以为图里有多余模块 —— 直接丢。
+    const connected = new Set();
+    for (const edge of collapsed.edges) {
+        connected.add(edge.from);
+        connected.add(edge.to);
+    }
+    const keptNodes = collapsed.nodes.filter((node) => connected.has(node.id));
+    if (keptNodes.length < DIAGRAM_MIN_NODES) return null;
+
+    let title = typeof data.title === 'string' ? data.title.replace(/\s+/g, ' ').trim() : '';
+    // 模型会把模板里的占位说明原样抄进 title（实测出现过 "图的标题，没有就空串"），
+    // 那不是标题，画到图上只会是噪音。
+    if (/图的标题|没有就空串|图的标题，/.test(title)) title = '';
+    return shrinkGraph({ title, nodes: keptNodes, edges: collapsed.edges });
+}
+
+/**
+ * 超上限时按"删最边缘的叶子"裁剪，而不是按输入顺序砍。
+ *
+ * 为什么不能按顺序：模型是按行输出的，`if (nodes.length >= MAX) break` 会把最后几行
+ * 的节点整段丢掉 —— 实测一张 23 节点的组织图，最右侧"经营三部 + 三个业务办"整列消失，
+ * 看着就像模型漏读。改成"从叶子节点里挑度最小的删"，各分支会被均匀保留，主干不受影响。
+ */
+function shrinkGraph(graph) {
+    let current = graph;
+    const withinLimits = (g) => g.nodes.length <= DIAGRAM_MAX_NODES && g.edges.length <= DIAGRAM_MAX_EDGES;
+    for (let guard = 0; guard < 400; guard += 1) {
+        if (withinLimits(current)) return current;
+        if (current.nodes.length <= DIAGRAM_MIN_NODES) return current;
+        const victim = pickLeafVictim(current);
+        if (!victim) return current;
+        current = {
+            title: current.title,
+            nodes: current.nodes.filter((node) => node.id !== victim.id),
+            edges: current.edges.filter((edge) => edge.from !== victim.id && edge.to !== victim.id),
+        };
+    }
+    return current;
+}
+
+/**
+ * 洗一个标签：它在 PlantUML 里是双引号字符串。
+ *
+ * 引号必须去掉：模型会把图里的引号原样抄进 label，直接塞进去会把字符串提前闭合。
+ * 代码围栏也要去掉（否则生成的块会被 md 提前截断）；换行压成空格避免撑破版面。
+ */
+function sanitizePumlLabel(text) {
+    const value = String(text == null ? '' : text)
+        .replace(/"/g, "'")
+        .replace(/`/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    return value || '(未命名)';
+}
+
+/**
+ * 判断一个"节点标签"其实是版面标注，而不是模块名。
+ *
+ * 依据（都是版式信息图特有的痕迹，真正的流程图/架构图模块名不会这样）：
+ * - 含句读（`：` `，` `。` `；` `、`）：模块名不会写成一句话；
+ * - 含间隔号 `·`：常见于"公司级统筹层·规"这类分层标注。
+ *
+ * **不能用省略号 `…` 当证据**：那是我们自己 `truncateLabel` 截断长名字留下的痕迹，
+ * 长名字的模块（`Eastern Hemisphere Solution…`）本来就会带 —— 拿它判会把正常架构图
+ * 误伤成版式图（实测一张 12 节点的组织图因此被退回描述）。
+ */
+function isAnnotationLabel(label) {
+    const text = String(label || '');
+    if (!text) return false;
+    if (text.includes('·')) return true;
+    return /[：:，,。；;、]/.test(text);
+}
+
+/**
+ * 图上"节点"里有多少其实是版面标注。
+ *
+ * 为什么需要这条兜底：分类只看图，遇到"色块分区 + 装饰箭头"的版式信息图会判成
+ * 结构图（同一张图在不同提示词下还翻过面）。但版式图的"节点"必然是分层标注、
+ * 说明长句 —— 一旦这类标签占比过高，说明这根本不是结构图，应当退回描述。
+ *
+ * 阈值取"至少 3 个且占比 1/4"：实测版式图里这类标签约 5/18（27.8%）能被抓住，
+ * 而正常架构图里带标点的名字通常 0~1 个，够不上这个比例。
+ */
+function annotationHeavy(graph) {
+    if (!graph || !Array.isArray(graph.nodes) || graph.nodes.length === 0) return false;
+    const bad = graph.nodes.filter((node) => isAnnotationLabel(node.label)).length;
+    return bad >= 3 && bad / graph.nodes.length >= 0.25;
+}
+
+/**
+ * 把图结构渲染成 PlantUML 文本。
+ *
+ * 别名统一重排成 n1..nK **并按节点顺序先全部声明**，再输出边 —— 模型给的数据里
+ * 别名什么样都可能（中文、数字开头、重复），直接用它极易写出非法代码，而"先声明
+ * 后引用"正是实测里模型自己最容易写错的点。
+ *
+ * @param {{title: string, nodes: Array, edges: Array}} graph
+ * @returns {string} `@startuml … @enduml`，graph 不可用时返回空串
+ */
+function renderPuml(graph) {
+    if (!graph || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) return '';
+    if (graph.nodes.length === 0) return '';
+    const alias = new Map();
+    // 竖排：阅读区宽度只有 600 多像素，横排的图一定被裁（实测左边 Embedding 整块被切掉）；
+    // 高度可以正常滚动，宽度不能溢出。
+    const lines = ['@startuml', 'top to bottom direction'];
+    if (graph.title) lines.push(`title ${sanitizePumlLabel(graph.title)}`);
+    graph.nodes.forEach((node, index) => {
+        const name = `n${index + 1}`;
+        alias.set(node.id, name);
+        lines.push(`rectangle "${sanitizePumlLabel(node.label)}" as ${name}`);
+    });
+    for (const edge of graph.edges) {
+        const from = alias.get(edge.from);
+        const to = alias.get(edge.to);
+        if (!from || !to) continue;
+        const label = String(edge.label == null ? '' : edge.label).trim();
+        lines.push(label ? `${from} --> ${to} : ${sanitizePumlLabel(label)}` : `${from} --> ${to}`);
+    }
+    lines.push('@enduml');
+    return lines.join('\n');
+}
+
+
+/**
+ * 只去掉"两家说法相反"的边：主模型给 A→B、复核模型给 B→A，说明这条边的方向读不准，
+ * 删掉；其余边全部保留。
+ *
+ * 为什么不用"取交集"：两个模型在"自下而上"这类图上常整套读反，交集会把整条链拆成碎片
+ * （实测 Transformer 只剩 3 条边）。只删方向矛盾的边，既保住了结构，又不会画出反的箭头。
+ *
+ * 节点按**标签**对齐（id 是模型自己编的，两次不可能一样）。
+ *
+ * @returns {{title: string, nodes: Array, edges: Array}|null} 剩下的太少则返回 null
+ */
+function subtractContradictions(primary, judge) {
+    if (!primary) return null;
+    if (!judge) return primary;
+    const keyOf = (labelOf) => (edge) => {
+        const from = labelOf.get(edge.from);
+        const to = labelOf.get(edge.to);
+        return from && to ? `${from}→${to}` : '';
+    };
+    const primaryKey = keyOf(new Map(primary.nodes.map((node) => [node.id, node.label])));
+    const judgeKey = keyOf(new Map(judge.nodes.map((node) => [node.id, node.label])));
+
+    const judgeEdges = new Set();
+    for (const edge of judge.edges) {
+        const key = judgeKey(edge);
+        if (key) judgeEdges.add(key);
+    }
+    const edges = [];
+    for (const edge of primary.edges) {
+        const key = primaryKey(edge);
+        if (!key) continue;
+        const cut = key.indexOf('→');
+        const reversed = `${key.slice(cut + 1)}→${key.slice(0, cut)}`;
+        if (judgeEdges.has(reversed)) continue; // 方向被另一个模型否定
+        edges.push(edge);
+    }
+    if (edges.length < DIAGRAM_MIN_EDGES) return null;
+    // 边被删掉后变孤立的节点一并去掉，不画漂浮框。
+    const used = new Set();
+    for (const edge of edges) {
+        used.add(edge.from);
+        used.add(edge.to);
+    }
+    const nodes = primary.nodes.filter((node) => used.has(node.id));
+    if (nodes.length < DIAGRAM_MIN_NODES) return null;
+    return { title: primary.title, nodes, edges };
+}
+
+/**
+ * 截断标签，尽量按词边界切。
+ *
+ * 直接 slice 会把英文切成 "Asia-Pacific Sales Departmen…" 这种半个词，图上很难读；
+ * 这里优先切在最后一个空格处（中文没有空格时退回硬切）。
+ */
+function truncateLabel(text, limit) {
+    const value = String(text == null ? '' : text);
+    if (value.length <= limit) return value;
+    const head = value.slice(0, limit);
+    const space = head.lastIndexOf(' ');
+    const base = space > limit * 0.5 ? head.slice(0, space) : head;
+    return `${base.trimEnd()}…`;
+}
+
+/**
+ * 一段草图渲染后的字符上限。
+ *
+ * 实测：846 字符能渲染，886 字符渲染不出来 —— 边界落在 850~880 之间。
+ * 取 860 留一点余量，宁可少保留一两个末端节点，也不能整段画不出来。
+ */
+const DIAGRAM_MAX_PUML_CHARS = 860;
+
+/**
+ * 挑一个"最该删"的叶子节点。
+ *
+ * 两条硬约束：
+ * 1. 只挑"有父节点、没有子节点"的 —— 永远删不到根和主干；
+ * 2. **优先删最深的**叶子 —— 层级越深越外围。
+ *
+ * 第 2 条是踩坑改出来的：早先按"兄弟最多的分支优先"删，结果一张组织图
+ * （浩鲸科技 → 8 个中心 → 各部门）里，根下面那 8 个中心恰好都是"浅层叶子"，
+ * 于是"国内业务运营中心""国际业务运营中心"被当成外围节点删掉了 —— 顶层主干
+ * 反而先掉。正确顺序应当是：先削最底层的团队，顶层的中心一个都不能少。
+ */
+function pickLeafVictim(graph) {
+    const outCount = new Map();
+    const inCount = new Map();
+    const parentOf = new Map();
+    const childrenOf = new Map();
+    for (const edge of graph.edges) {
+        outCount.set(edge.from, (outCount.get(edge.from) || 0) + 1);
+        inCount.set(edge.to, (inCount.get(edge.to) || 0) + 1);
+        if (!parentOf.has(edge.to)) parentOf.set(edge.to, edge.from);
+        if (!childrenOf.has(edge.from)) childrenOf.set(edge.from, []);
+        childrenOf.get(edge.from).push(edge.to);
+    }
+    // 从根（没有入边的节点）开始算深度，防环用 visited 限制。
+    const depth = new Map();
+    const roots = graph.nodes.filter((node) => !inCount.has(node.id));
+    const queue = (roots.length ? roots : graph.nodes.slice(0, 1)).map((node) => [node.id, 0]);
+    const seen = new Set();
+    while (queue.length) {
+        const [id, d] = queue.shift();
+        if (seen.has(id)) continue;
+        seen.add(id);
+        depth.set(id, d);
+        for (const child of childrenOf.get(id) || []) queue.push([child, d + 1]);
+    }
+    const leaves = graph.nodes.filter((node) => (outCount.get(node.id) || 0) === 0 && parentOf.has(node.id));
+    if (leaves.length === 0) return null;
+    const leafSiblings = new Map();
+    for (const leaf of leaves) {
+        const parent = parentOf.get(leaf.id);
+        leafSiblings.set(parent, (leafSiblings.get(parent) || 0) + 1);
+    }
+    return leaves.slice().sort((a, b) => {
+        // 先比深度：深的先删（最外围）
+        const da = depth.get(a.id) || 0;
+        const db = depth.get(b.id) || 0;
+        if (da !== db) return db - da;
+        // 同深度时，优先削"兄弟多"的分支，让各分支均匀保留
+        const ca = leafSiblings.get(parentOf.get(a.id)) || 0;
+        const cb = leafSiblings.get(parentOf.get(b.id)) || 0;
+        return cb - ca;
+    })[0];
+}
+
+/**
+ * 把图裁到"渲染得出来"的体量：超出字符上限就从叶子节点开始删。
+ *
+ * 只删叶子：删中间节点会把链断成两截，看起来就像逻辑错了。
+ */
+function fitGraph(graph) {
+    let current = graph;
+    for (let guard = 0; guard < 300 && current; guard += 1) {
+        if (renderPuml(current).length <= DIAGRAM_MAX_PUML_CHARS) return current;
+        if (current.nodes.length <= DIAGRAM_MIN_NODES) return current;
+        const victim = pickLeafVictim(current);
+        if (!victim) return current;
+        current = {
+            title: current.title,
+            nodes: current.nodes.filter((node) => node.id !== victim.id),
+            edges: current.edges.filter((edge) => edge.from !== victim.id && edge.to !== victim.id),
+        };
+    }
+    return current;
+}
+
+/**
+ * 合并"完全冗余"的节点：标签相同、且**邻居 id 完全一致**的多个节点其实是同一个框。
+ *
+ * 为什么必须用邻居 id 而不是标签：VGG19 那种 `512→512→512` 的长链里，每个中间节点的
+ * 邻居"标签"都一样（前一个 512、后一个 512），按标签判就会把整条链压成一个节点。
+ * 按 id 判则只有真正的重复（同一个框被模型写成三个 id）才会命中 —— 实测 BiLSTM 的
+ * `h_t-1` 被拆成三个，导致 `h_t-1 → h_t-1` 自环与重复边。
+ *
+ * @returns {{nodes: Array, edges: Array, merged: number}}
+ */
+function mergeRedundantNodes(nodes, edges) {
+    const signature = (node) => {
+        const parts = [];
+        for (const edge of edges) {
+            if (edge.from === node.id) parts.push(`>${edge.to}`);
+            if (edge.to === node.id) parts.push(`<${edge.from}`);
+        }
+        return parts.sort().join('|');
+    };
+    const firstOf = new Map();
+    const remap = new Map();
+    const kept = [];
+    for (const node of nodes) {
+        const key = `${node.label}#${signature(node)}`;
+        const existing = firstOf.get(key);
+        if (existing) {
+            remap.set(node.id, existing);
+            continue;
+        }
+        firstOf.set(key, node.id);
+        remap.set(node.id, node.id);
+        kept.push(node);
+    }
+    if (kept.length === nodes.length) return { nodes, edges, merged: 0 };
+    const seen = new Set();
+    const nextEdges = [];
+    for (const edge of edges) {
+        const from = remap.get(edge.from);
+        const to = remap.get(edge.to);
+        if (!from || !to || from === to) continue; // 合并后产生的自环直接丢
+        const key = `${from}>${to}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        nextEdges.push({ from, to, label: edge.label });
+    }
+    return { nodes: kept, edges: nextEdges, merged: nodes.length - kept.length };
 }
 
 /** 一张图的稳定标识：优先用 `path=` 参数（同一路径=同一张图），否则退回原地址。 */
@@ -524,26 +1081,70 @@ function countExistingDesc(md) {
  * @param {Map<string, string>} descByKey refKey → 描述
  * @returns {{content: string, injected: number}}
  */
+/**
+ * 生成一张图要插入的行：描述注释（可能没有）+ PlantUML 代码块（可能没有）。
+ *
+ * 代码块必须放在注释**外面**：① 注释渲染后是隐形的，塞进去人就看不到草图；
+ * ② PlantUML 的箭头 `-->` 是合法语法，放进 `<!-- -->` 会提前闭合注释、把后面的
+ * 图片行整段吞掉。所以围栏里的内容一律原样写入，不做任何转义。
+ *
+ * @param {string|{text?: string, puml?: string}} entry 描述文本，或 {text, puml}
+ * @param {string} eol 锚点行的行尾（CRLF 文档要保持 CRLF）
+ * @returns {string[]} 要插在图片行前面的行
+ */
+function describeInsertLines(entry, eol) {
+    const value = typeof entry === 'string' ? { text: entry } : entry || {};
+    const lines = [];
+    if (value.text) lines.push(`${DESC_PREFIX}${value.text}${DESC_SUFFIX}${eol}`);
+    if (value.puml) {
+        // 代码围栏：这个平台的渲染器会把 ```plantuml 渲染成真的方框图 —— 这是实测
+        // 唯一"能让人看到草图"的写法。其它写法都试过、都失败：
+        //   - `<details>` 折叠：不支持（标签被当原文显示、折叠不生效，还会吃掉后续 markdown）；
+        //   - HTML 注释：被当灰底代码块直接显示出来，既不隐身也不成图。
+        // 所以"默认收起、点击展开"属于查看器的能力，内容侧只提供围栏。
+        lines.push(`${DIAGRAM_FENCE}${eol}`);
+        for (const line of String(value.puml).split('\n')) lines.push(`${line}${eol}`);
+        lines.push(`${DIAGRAM_FENCE_END}${eol}`);
+    }
+    return lines;
+}
+
 function injectDescriptions(md, descByKey) {
-    const lines = String(md).split('\n');
+    const source = String(md);
+    const lines = source.split('\n');
+    // 插入行统一用整个文件的主导换行：CRLF 文件最后一行的 line 不带 \r，
+    // 按行取行尾会让插在末行前的注释变成裸 LF，写回后与文件其余部分不一致。
+    const insertEol = /\r\n/.test(source) ? '\r' : '';
     const out = [];
     let injected = 0;
+    let removed = 0;
     for (const line of lines) {
-        const eol = line.endsWith('\r') ? '\r' : '';
-        const keys = [];
+        // 主 md 里如果本来就带着 image-desc 注释（平台解析时写的，或人工加过的），
+        // 先剥掉再插新的 —— 否则同一张图会出现「旧注释 + 新草图 + 新注释」叠在一起，
+        // 看着就像同一张图既给了草图又给了注释。
+        if (/^<!--\s*image-desc:/.test(line.trim())) {
+            removed += 1;
+            continue;
+        }
+        const refs = [];
         for (const rawRef of collectRawRefs(line)) {
             const raw = normalizeRawRef(rawRef);
             if (!raw) continue;
             const key = refKey(raw);
-            if (descByKey.has(key) && !keys.includes(key)) keys.push(key);
+            if (!refs.some((item) => item.key === key)) refs.push({ key, raw });
         }
+        const keys = refs.filter((item) => descByKey.has(item.key)).map((item) => item.key);
         for (const key of keys) {
-            out.push(`${DESC_PREFIX}${descByKey.get(key)}${DESC_SUFFIX}${eol}`);
+            for (const inserted of describeInsertLines(descByKey.get(key), insertEol)) out.push(inserted);
             injected += 1;
         }
-        out.push(line);
+        // 无论这张图出的是草图还是注释，原图都不再嵌进正文（图大、且与产出重复），
+        // 只留一行可点链接，需要对照时点开原图。
+        const replaceWithLink = refs.length === 1 && keys.length === 1;
+        if (replaceWithLink) out.push(`${DIAGRAM_IMAGE_LINK_PREFIX}${refs[0].raw})${insertEol}`);
+        else out.push(line);
     }
-    return { content: out.join('\n'), injected };
+    return { content: out.join('\n'), injected, removed };
 }
 
 /** 并发受限地跑一批任务；结果按输入顺序返回。 */
@@ -731,7 +1332,18 @@ function resolveVisionConfig(base, params) {
     // 想真正写得更长要同时放宽提示词（buildPrompt 已经不放句数限制）。
     const configuredLimit = Number(params.maxDescChars || source.maxDescChars || process.env.VISION_MAX_DESC_CHARS);
     const maxDescChars = Number.isInteger(configuredLimit) && configuredLimit > 0 ? configuredLimit : DESC_MAX_CHARS;
-    return { url, key, model, fallbackModel, maxDescChars };
+    // 结构图开关：参数 > 配置 > 环境变量 > 默认值；认不出的值静默回落（配置写错不该让整篇失败）。
+    const diagramRaw = String(params.diagram || source.diagram || process.env.VISION_DIAGRAM || DEFAULT_DIAGRAM_MODE)
+        .trim()
+        .toLowerCase();
+    const diagram = DIAGRAM_MODES.includes(diagramRaw) ? diagramRaw : DEFAULT_DIAGRAM_MODE;
+    // 复核模型：参数 > 配置 > 环境变量 > 默认值；显式传空串表示关闭（只读一遍）。
+    const judgeRaw =
+        params.judgeModel === undefined || params.judgeModel === null
+            ? source.judgeModel || process.env.VISION_JUDGE_MODEL || DEFAULT_VISION_JUDGE_MODEL
+            : params.judgeModel;
+    const judgeModel = String(judgeRaw || '').trim();
+    return { url, key, model, fallbackModel, maxDescChars, diagram, judgeModel };
 }
 
 /**
@@ -745,7 +1357,7 @@ function resolveVisionConfig(base, params) {
  *
  * 关键点：精确 ≠ 简短。专有名词、数值、单位、公式要原样照抄；要删的是重复与装饰。
  */
-function buildPrompt(docNameText, index, total) {
+function buildProsePrompt(docNameText, index, total) {
     return (
         `这是文档《${docNameText}》中的一张图片（第 ${index}/${total} 张）。` +
         '请用中文精确描述这张图，直接给描述，不要以"这张图片/该图"开头，不要客套。\n' +
@@ -763,6 +1375,109 @@ function buildPrompt(docNameText, index, total) {
         '   写"红框标出雪坡上的滑雪者"；不要写"滑雪者被一个红色矩形框标注，框线为红色实线"。\n' +
         '5. 长度服务于信息量：简单图 1–2 句即可；复杂图表/架构图按需展开，但每一句都要有新信息。\n' +
         '6. 看不清的文字或数字不要编造，直接省略。'
+    );
+}
+
+/**
+ * 分类提示词：只让它回答一个词。
+ *
+ * 为什么单独拆一次调用：实测把"先判断再执行"写进同一个提示词里，模型会直接忽略判断、
+ * 看到方框就吐 JSON（海报式的分层色块图也被硬凑成结构图）。拆成单任务后它很听话。
+ *
+ * 判据是用户给的：这张图的**信息是不是由结构承载**，而不是"看起来像不像流程图"。
+ */
+function buildKindPrompt() {
+    return (
+        '只回答一个词，不要解释、不要标点。\n' +
+        '先逐条核对下面两条（是结构图必须**同时满足**）：\n' +
+        '  (1) 图中有**连接线**（箭头、实线或虚线）把不同的方框连起来；\n' +
+        '  (2) 去掉这些连线之后，方框之间的先后/包含/流转关系就无从得知。\n' +
+        '两条都满足 → 只回答 STRUCTURE（流程图、架构图、系统结构图、时序图都算，节点再多也算）。\n' +
+        '任何一条不满足 → 只回答 PROSE。特别注意这几种**一律 PROSE**：\n' +
+        '  · 靠色块分区、左右分栏、竖排标注来表达关系的版式图/信息图/海报；\n' +
+        '  · 方框之间没有连线的组织架构图、部门并列表；\n' +
+        '  · 框里是成段说明文字、宣传文案、职责描述，而不是模块名；\n' +
+        '  · 照片、界面截图、纯文字、曲线图、柱状图、表格。'
+    );
+}
+
+/**
+ * 解析分类结果：按**首词**判断，不能全文搜关键字符。
+ *
+ * 早先用 `/STRUCTURE/i.test(text)`，模型只要回一句 `PROSE（不符合 STRUCTURE 条件）`
+ * 就会被误判成结构图 —— 而这一句恰恰是最常见的回答形式。
+ */
+function parseKind(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return 'prose';
+    // 模型可能不按约定的英文回答，先认中文首词（只认开头，避免"非结构图"这类反话被误读）。
+    if (/^(结构|流程图|架构图)/.test(raw)) return 'structure';
+    if (/^(描述|注释|非结构)/.test(raw)) return 'prose';
+    const value = raw.toUpperCase();
+    if (/^STRUCT/.test(value)) return 'structure';
+    if (/^PROSE/.test(value)) return 'prose';
+    // 首词认不出时再看：两个关键词只出现一个才采用，同时出现按 prose（保守，不出错图）。
+    const hasStructure = value.includes('STRUCTURE');
+    const hasProse = value.includes('PROSE');
+    if (hasStructure && !hasProse) return 'structure';
+    return 'prose';
+}
+
+/**
+ * 一张图的提示词：结构图给「节点/边」数据，其它图给中文描述。
+ *
+ * 二选一写在同一段里、由模型自己判类型 —— 因为判错代价不对称：把一张曲线图
+ * 误判成结构图，会用它换掉一段本来好好的描述。让真正看过图的那一次调用去判，
+ * 比在描述文本里匹配"流程图/箭头"这类关键词准得多，也不多花一次请求。
+ *
+ * `diagramMode === 'off'` 时原样回到纯描述提示词（行为与加这个功能之前一致）。
+ *
+ * @param {string} docNameText 文档名
+ * @param {number} index 第几张（1 起）
+ * @param {number} total 共几张
+ * @param {string} [diagramMode] 'on' / 'off'
+ * @returns {string}
+ */
+function buildPrompt(docNameText, index, total, diagramMode) {
+    const prose = buildProsePrompt(docNameText, index, total);
+    if (diagramMode === 'off') return prose;
+    const head = `这是文档《${docNameText}》中的一张图片（第 ${index}/${total} 张）。`;
+    return (
+        head +
+        '按下面二选一作答，只输出其中一种，不要解释、不要代码围栏、不要收尾提问。\n' +
+        'A. 结构图（流程图、架构图、结构示意图、框图、时序图、状态图 —— 信息只能通过"谁连着谁、谁包含谁、' +
+        '怎么分支、怎么汇合"表达，去掉方框和箭头信息就没了）：只输出一个 JSON 对象，别的什么都不要写：\n' +
+        '{"title":"图的标题，没有就空串","nodes":[{"id":"n1","label":"图中原文"}],' +
+        '"edges":[{"from":"n1","to":"n2","label":"箭头上或线上的文字"}]}\n' +
+        '   规则（按重要性，每条都对应实测踩过的坑）：\n' +
+        '   1. label 照抄图中原文，不改写、不翻译、不概括；看不清的节点直接不写，禁止编造；节点不超过 20 个。\n' +
+        // 实测：一张图里两条并列支路（图像支路/文本支路）会被它连成同一个输入，凭空多出跨支路的边。
+        '   2. 并列的多条支路不要互连：图里 A 只连到 B，就不要写 A→C —— 即使 B、C 是同类模块、看起来"应该"都接 A。\n' +
+        // 实测：图像 + 文字两个输入时，它只留文字那个节点，图像整路消失，于是文字"看起来"连了一圈。
+        '   2b. 图上有几个并列的输入就写几个输入节点：例如左边一幅图像、下面一段文字，要分别列成两个节点、' +
+        '各自只连到自己那一路，不要把两个输入合成一个，也不要只写其中一个。\n' +
+        // 实测：模型会按版面顺序猜方向，自下而上 / 自右向左的图会被整体读反。
+        '   3. 箭头方向必须照抄：from 是箭头起点、to 是终点，与版面上下左右无关；' +
+        '箭头朝上就写 下面的节点→上面的节点，朝左就写 右边的节点→左边的节点，不要按阅读顺序猜。\n' +
+        // 实测：分层的堆叠会被跨层直连（输入直接连到第三层、第一层直接连到最末层）。
+        '   4. 竖向排列的模块是一层一层往下（或往上）串联，不要跨层直连；只有图上确实有一条跨层的线才写。\n' +
+        // 实测：残差连接（绕过模块再汇合）常被整体丢掉，图就少了最难画的那部分。
+        '   5. 绕过某个模块又汇合回来的弧线（残差/跳连）必须画出来；⊕、+ 这类相加节点要保留。\n' +
+        // 实测：N× 被当成节点，甚至被画成一条回到块首的回边。
+        '   6. N×、L×、×N 只表示"这个块重复几次"：既不是节点，也不是一条连线，不要画成回边。\n' +
+        // 实测：虚线框/大括号旁的分组标题（Transformer Encoder、BiLSTM、VGG19）被当成流程节点，
+        // 于是"标题→内容"被画成一条边，整张图的方向就反了。
+        '   7. 虚线框或大括号旁边的文字（如 Transformer Encoder、BiLSTM、VGG19）是这一组的**标题**，' +
+        '不是流程节点：不要把它列成节点，也不要用它连边；组内的模块按它们之间箭头的实际方向连。\n' +
+        // 实测：BiLSTM 那种"正向/反向两排同名模块"会被并成一排，反向那一层整层消失。
+        '   8. 图上并排的两排（或两列）模块即使名字相同（例如正向 LSTM 与反向 LSTM 都叫 h），' +
+        '也要**分别列成两组节点**，用图上的行标题或下标区分（如 h_t 与 h′_t）；' +
+        '行标题本身不算节点，但要用它把两排区分开，绝不能合并成一层。\n' +
+        '   9. 每个出边单独一条，不要合并。\n' +
+        'B. 其它图（海报/宣传图/分层色块的版式图、照片、界面截图、纯文字、曲线图、柱状图、表格等）：' +
+        '按下面的规则写中文描述。\n' +
+        // 复用同一段描述规则文本，保证"结构图关掉"与"其它图"两条路径逐字一致。
+        prose.slice(head.length)
     );
 }
 
@@ -907,20 +1622,176 @@ async function describeOneImage(ref, visionConfig, ctx, position) {
     if (!mime) return { ok: false, error: 'NOT_IMAGE', message: '返回的内容不是图片（可能是错误页）' };
 
     try {
+        // 先单独判一次"这张图该出结构还是该写描述"。判断和执行拆成两次调用，
+        // 是因为实测同一个提示词里写"先判断再执行"时，模型会跳过判断直接吐 JSON。
+        let kind = 'prose';
+        if (ctx.diagramMode !== 'off') {
+            try {
+                const judge = await vision.describeImage({
+                    baseUrl: visionConfig.url,
+                    apiKey: visionConfig.key,
+                    model: visionConfig.model,
+                    image: bytes,
+                    mime,
+                    prompt: buildKindPrompt(),
+                    maxTokens: 16,
+                    state: ctx.state,
+                });
+                if (judge.rateLimited) ctx.rateLimited += judge.rateLimited;
+                kind = parseKind(judge.text);
+                if (kind === 'structure') ctx.diagramStructured += 1;
+                else ctx.diagramAsProse += 1;
+            } catch {
+                // 判断失败不阻断：按"描述"走，至少保证有产出。
+                ctx.diagramAsProse += 1;
+                kind = 'prose';
+            }
+        }
+
         const out = await vision.describeImage({
             baseUrl: visionConfig.url,
             apiKey: visionConfig.key,
             model: visionConfig.model,
             image: bytes,
             mime,
-            prompt: buildPrompt(ctx.docName, position, ctx.total),
-            maxTokens: DESC_MAX_TOKENS,
+            // 判定是"描述"时直接用纯描述提示词，从源头上避免模型硬凑成结构。
+            prompt: buildPrompt(ctx.docName, position, ctx.total, kind === 'structure' ? ctx.diagramMode : 'off'),
+            maxTokens:
+                ctx.diagramMode === 'off' || kind !== 'structure'
+                    ? DESC_MAX_TOKENS
+                    : Math.max(DESC_MAX_TOKENS, DIAGRAM_MAX_TOKENS),
             state: ctx.state,
         });
         const limit = ctx.maxDescChars || DESC_MAX_CHARS;
-        const raw = String(out.text || '').replace(/\s+/g, ' ').trim();
+        let raw = String(out.text || '').replace(/\s+/g, ' ').trim();
         if (!raw) return { ok: false, error: 'EMPTY_DESC', message: '模型返回空描述' };
         if (out.rateLimited) ctx.rateLimited += out.rateLimited;
+
+        // 可疑复核（只对自相矛盾的样本补问一次，不每张都花这个成本）：
+        // 判成"描述"，可这次回答里却出现了图数据签名 `"nodes":` —— 说明它其实看得到结构，
+        // 分类那次很可能判错。这时改用结构提示词重问一次，能出图就用图。
+        if (kind === 'prose' && ctx.diagramMode !== 'off' && /"nodes"\s*:/.test(raw)) {
+            ctx.diagramSuspect += 1;
+            try {
+                const retry = await vision.describeImage({
+                    baseUrl: visionConfig.url,
+                    apiKey: visionConfig.key,
+                    model: visionConfig.model,
+                    image: bytes,
+                    mime,
+                    prompt: buildPrompt(ctx.docName, position, ctx.total, ctx.diagramMode),
+                    maxTokens: Math.max(DESC_MAX_TOKENS, DIAGRAM_MAX_TOKENS),
+                    state: ctx.state,
+                });
+                if (retry.rateLimited) ctx.rateLimited += retry.rateLimited;
+                const retryText = String(retry.text || '').replace(/\s+/g, ' ').trim();
+                if (/"nodes"\s*:/.test(retryText)) {
+                    const graph = parseGraph(retryText);
+                    const puml = graph ? renderPuml(fitGraph(graph) || graph) : '';
+                    if (puml) {
+                        ctx.diagramStructured += 1;
+                        ctx.diagramAsProse -= 1; // 分类改判：从"描述"挪到"结构"
+                        ctx.diagramRendered += 1;
+                        ctx.diagramNodes += (fitGraph(graph) || graph).nodes.length;
+                        ctx.diagramEdges += (fitGraph(graph) || graph).edges.length;
+                        return { ok: true, kind: 'diagram', puml, ms: out.ms };
+                    }
+                }
+                raw = retryText || raw;
+            } catch {
+                // 复核失败就按原来的描述走
+            }
+        }
+
+        // A 类（结构图）：模型给的是「节点/边」数据 → 由 renderPuml 生成语法合法的草图，
+        // 不再写散文注释。模型只负责看懂结构，拼语法这件事交给代码。
+        // 入口条件看 `"nodes":` 这个图数据签名：普通描述里即使夹着公式花括号（\frac{a}{b}）
+        // 也不会被误当成 JSON 处理。
+        if (ctx.diagramMode !== 'off' && /"nodes"\s*:/.test(raw)) {
+            const jsonText = extractJsonObject(raw);
+            const graph = jsonText ? parseGraph(jsonText) : null;
+            // 兜底校验：判成结构图、但"节点"里大半是版面标注（分层标签、说明长句），
+            // 说明这其实是版式信息图 —— 不画草图，走下面的描述回退。
+            if (graph && annotationHeavy(graph)) {
+                ctx.diagramAnnotationGuard += 1;
+                ctx.diagramAsProse += 1;
+                if (ctx.diagramStructured > 0) ctx.diagramStructured -= 1;
+            } else if (graph) {
+                let finalGraph = graph;
+                // 复核：同一个提示词换一个模型再读一遍，只保留两边都认可的连线。
+                // 复核失败（限流/超时/没给出可用数据）不拖垮这张图，退回主模型结果。
+                if (ctx.judgeModel && ctx.judgeModel !== visionConfig.model) {
+                    ctx.diagramDual += 1;
+                    try {
+                        const second = await vision.describeImage({
+                            baseUrl: visionConfig.url,
+                            apiKey: visionConfig.key,
+                            model: ctx.judgeModel,
+                            image: bytes,
+                            mime,
+                            prompt: buildPrompt(ctx.docName, position, ctx.total, ctx.diagramMode),
+                            maxTokens: Math.max(DESC_MAX_TOKENS, DIAGRAM_MAX_TOKENS),
+                            state: ctx.state,
+                        });
+                        if (second.rateLimited) ctx.rateLimited += second.rateLimited;
+                        const merged = subtractContradictions(graph, parseGraph(second.text || ''));
+                        if (merged) {
+                            finalGraph = merged;
+                            ctx.diagramAgreed += 1;
+                        } else {
+                            ctx.diagramDualFallback += 1;
+                        }
+                    } catch {
+                        ctx.diagramDualFallback += 1;
+                    }
+                }
+                const fitted = fitGraph(finalGraph) || finalGraph;
+                const puml = renderPuml(fitted);
+                if (puml) {
+                    ctx.diagramRendered += 1;
+                    ctx.diagramNodes += fitted.nodes.length;
+                    ctx.diagramEdges += fitted.edges.length;
+                    return { ok: true, kind: 'diagram', puml, ms: out.ms };
+                }
+            }
+            // 给了图数据却用不了（被 max_tokens 截断、节点太少、边悬空）→ 回退成散文：
+            // 把 JSON 那段剔掉，剩下的文字才算描述；什么都不剩就诚实记失败，
+            // 绝不把半截 JSON 当成描述写进注释。
+            ctx.diagramFallback += 1;
+            const cut = raw.indexOf('{');
+            const stripped = (cut > 0 ? raw.slice(0, cut) : '')
+                .replace(/```[a-zA-Z]*/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (stripped.length < 8) {
+                // 结构数据不可用、又没剩下文字 → 再用"纯描述"提示词补一次。
+                // 自主判断（草图 or 注释）必须闭环：每张图最终要么有草图、要么有注释。
+                try {
+                    const proseOut = await vision.describeImage({
+                        baseUrl: visionConfig.url,
+                        apiKey: visionConfig.key,
+                        model: visionConfig.model,
+                        image: bytes,
+                        mime,
+                        prompt: buildPrompt(ctx.docName, position, ctx.total, 'off'),
+                        maxTokens: DESC_MAX_TOKENS,
+                        state: ctx.state,
+                    });
+                    if (proseOut.rateLimited) ctx.rateLimited += proseOut.rateLimited;
+                    ctx.diagramProseRetry += 1;
+                    const proseText = String(proseOut.text || '').replace(/\s+/g, ' ').trim();
+                    // 补的那次如果又给了图数据，说明它在两者间摇摆：不当描述用。
+                    if (proseText && !/"nodes"\s*:/.test(proseText)) {
+                        const text = sanitizeDesc(proseText, limit);
+                        if (text) return { ok: true, kind: 'text', text, ms: out.ms };
+                    }
+                } catch {
+                    // 补描述也失败 → 按失败处理
+                }
+                return { ok: false, error: 'DIAGRAM_INVALID', message: '结构数据不可用，且没有可用的文字描述' };
+            }
+            raw = stripped;
+        }
         // 撞上 max_tokens 是"看不见的截断"：长度可能没超上限，内容却停在半句。
         // 只靠长度判断发现不了，必须看 finish_reason。
         if (out.finishReason === 'length') ctx.incomplete += 1;
@@ -971,6 +1842,16 @@ async function describeOneImage(ref, visionConfig, ctx, position) {
     }
 }
 
+/**
+ * 把一张图的调用结果转成"要插入的内容"：结构图给 `{puml}`，散文给字符串。
+ *
+ * 两个分支走同一条注入路径，是为了让"注释在上、代码块随后、图片行不动"
+ * 这个顺序只有一处实现。
+ */
+function toDescEntry(result) {
+    return result && result.kind === 'diagram' ? { puml: result.puml } : result.text;
+}
+
 /** 处理单篇文档：校验 → 描述 → 拼装 → 保存 → 校验（含自愈）。 */
 async function describeDocument(root, config, visionConfig, docId, params, say) {
     const startedAt = Date.now();
@@ -993,7 +1874,8 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
     const warnings = [];
     const existing = countExistingDesc(original);
     if (existing > 0) {
-        warnings.push(`SOURCE_HAS_DESC：主 md 里已有 ${existing} 条 image-desc 注释，本次会在其上再插入一层`);
+        // 现在会先剥掉旧注释再插新的，所以这不是"叠加"而是"替换"，只在结果里交代一句。
+        warnings.push(`SOURCE_HAS_DESC：主 md 里已有 ${existing} 条 image-desc 注释，生成时会先剥掉这些旧注释再写入本次结果`);
     }
     if (parsed.unparsed.length > 0) {
         warnings.push(`有 ${parsed.unparsed.length} 处图片地址无法解析，已跳过`);
@@ -1023,6 +1905,24 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
         config,
         docName: name,
         total: picked.length,
+        // 结构图：开关 + 三个计数（出了几张草图、几张回退成描述、画了多少节点/边）。
+        diagramMode: visionConfig.diagram === 'off' ? 'off' : 'on',
+        judgeModel: visionConfig.judgeModel || '',
+        diagramDual: 0,
+        diagramAgreed: 0,
+        diagramDualFallback: 0,
+        diagramProseRetry: 0,
+        // 分类：判为"出结构"与"写描述"的张数，便于抽查判据是否合理
+        diagramStructured: 0,
+        diagramAsProse: 0,
+        // 可疑复核：判成描述但回答里出现图数据的张数（只对这些补问一次）
+        diagramSuspect: 0,
+        // 兜底校验：判成结构图、但节点大半是版面标注，被退回描述的张数
+        diagramAnnotationGuard: 0,
+        diagramRendered: 0,
+        diagramFallback: 0,
+        diagramNodes: 0,
+        diagramEdges: 0,
         rateLimited: 0,
         truncated: 0,
         compressed: 0,
@@ -1053,7 +1953,7 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
         }
     }
     if (firstResult.ok) {
-        descByKey.set(first.key, firstResult.text);
+        descByKey.set(first.key, toDescEntry(firstResult));
     } else if (firstResult.error === 'MODEL_UNAVAILABLE') {
         throw new DocchainError(
             'MODEL_UNAVAILABLE',
@@ -1073,10 +1973,17 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
             const ref = rest[index];
             say(`… ${index + 2}/${picked.length}`);
             const result = await describeOneImage(ref, activeConfig, ctx, index + 2);
-            if (result.ok) descByKey.set(ref.key, result.text);
+            if (result.ok) descByKey.set(ref.key, toDescEntry(result));
             else failed.push({ path: ref.key, error: result.error, message: result.message });
             return result;
         });
+    }
+
+    if (ctx.diagramFallback > 0) {
+        warnings.push(`DIAGRAM_FALLBACK：${ctx.diagramFallback} 张图给了结构数据但用不了（截断/节点太少），已回退成描述注释`);
+    }
+    if (ctx.diagramMode !== 'off' && ctx.diagramRendered === 0 && descByKey.size > 0) {
+        warnings.push('DIAGRAM_NONE：本次没有一张图产出结构草图（模型都按描述回答了）');
     }
 
     if (descByKey.size === 0) {
@@ -1105,6 +2012,27 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
         truncated: ctx.truncated,
         incomplete: ctx.incomplete,
         max_desc_chars: ctx.maxDescChars || DESC_MAX_CHARS,
+        // 结构图：rendered 是出了草图的张数；fallback 是想出图但数据不可用、已回退成注释的张数。
+        diagram: {
+            mode: ctx.diagramMode,
+            rendered: ctx.diagramRendered,
+            fallback: ctx.diagramFallback,
+            nodes: ctx.diagramNodes,
+            edges: ctx.diagramEdges,
+            // 复核：dual 是做了二次读图的张数，agreed 是交集可用的张数（其余退回主模型）。
+            judge_model: ctx.judgeModel || null,
+            dual: ctx.diagramDual,
+            agreed: ctx.diagramAgreed,
+            dual_fallback: ctx.diagramDualFallback,
+            // 结构数据不可用、补了一次纯描述才拿到注释的张数
+            prose_retry: ctx.diagramProseRetry,
+            // 分类计数：structured 判为"出结构"，as_prose 判为"写描述"，suspect 补问过一次的张数
+            structured: ctx.diagramStructured,
+            as_prose: ctx.diagramAsProse,
+            suspect: ctx.diagramSuspect,
+            // 判成结构图、但节点大半是版面标注，被兜底退回描述的张数
+            annotation_guard: ctx.diagramAnnotationGuard,
+        },
         failed,
         warnings,
         bytes_before: Buffer.byteLength(original),
@@ -1235,6 +2163,7 @@ async function main() {
             maxImages: args['max-images'],
             concurrency: args.concurrency,
             model: args.model,
+            diagram: args.diagram,
             dryRun: args['dry-run'],
             listModels: args['list-models'],
             read: args.read,
@@ -1267,9 +2196,27 @@ module.exports = {
     decodeEntities,
     refKey,
     countExistingDesc,
+    isAnnotationLabel,
+    annotationHeavy,
     normalizeEol,
     resolveImageUrl,
+    extractJsonObject,
+    parseGraph,
+    subtractContradictions,
+    renderPuml,
+    fitGraph,
+    shrinkGraph,
+    mergeRedundantNodes,
+    truncateLabel,
+    buildPrompt,
+    buildKindPrompt,
+    parseKind,
     DESC_MAX_CHARS,
+    DIAGRAM_MAX_NODES,
+    DIAGRAM_MAX_EDGES,
+    DIAGRAM_MAX_LABEL_CHARS,
+    DIAGRAM_MAX_PUML_CHARS,
+    DEFAULT_DIAGRAM_MODE,
     SENTINEL,
     DEFAULT_CONCURRENCY,
     MAX_CONCURRENCY,
