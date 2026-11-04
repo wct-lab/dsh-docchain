@@ -166,6 +166,11 @@ const DEFAULT_VISION_FALLBACK = 'g-deepseek-v4-flash';
  * 实测不同模型的读图错误不重叠（qwen 读错输入合并、doubao 读错反向层），交集能压掉编造的边。
  */
 const DEFAULT_VISION_JUDGE_MODEL = 'doubao-seed-2.0-pro';
+/**
+ * 推荐视觉模型，按综合能力排序。工具层的弹窗按这个顺序列出来，
+ * 复核模型撞车时也从这里挑替代。
+ */
+const PREFERRED_VISION_MODELS = ['qwen3-vl-plus', 'doubao-seed-2.0-pro', 'glm-5v-turbo'];
 
 const ARG_SPEC = {
     doc_ids: { type: 'string', default: null },
@@ -1342,7 +1347,16 @@ function resolveVisionConfig(base, params) {
         params.judgeModel === undefined || params.judgeModel === null
             ? source.judgeModel || process.env.VISION_JUDGE_MODEL || DEFAULT_VISION_JUDGE_MODEL
             : params.judgeModel;
-    const judgeModel = String(judgeRaw || '').trim();
+    let judgeModel = String(judgeRaw || '').trim();
+    // 复核的意义在于"换一个模型再读一遍"，和主模型相同时拿不到第二视角，
+    // 调用方会直接跳过（见 describeOneImage）。用户在弹窗里挑了 qwen3-vl-plus
+    // 这类恰好等于复核模型的选项时，复核会静默消失，这里自动换一个不同的。
+    // 显式传空串是"只读一遍"的意思，不能被这里复活。
+    if (judgeModel && judgeModel === model) {
+        judgeModel = DEFAULT_VISION_JUDGE_MODEL !== model
+            ? DEFAULT_VISION_JUDGE_MODEL
+            : PREFERRED_VISION_MODELS.find((id) => id !== model) || '';
+    }
     return { url, key, model, fallbackModel, maxDescChars, diagram, judgeModel };
 }
 
@@ -2220,4 +2234,6 @@ module.exports = {
     SENTINEL,
     DEFAULT_CONCURRENCY,
     MAX_CONCURRENCY,
+    PREFERRED_VISION_MODELS,
+    resolveVisionConfig,
 };

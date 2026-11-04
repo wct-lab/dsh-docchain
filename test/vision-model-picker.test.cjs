@@ -241,3 +241,92 @@ test('视觉模型只来自对话模型或用户点选，不存在第三条路�
     'skipVisionCheck 后门必须删除',
   );
 });
+
+// ---------------------------------------------------------------------------
+// 复核模型撞车避让
+//
+// 复核（judge）只在 judgeModel !== model 时执行——同一个模型读两遍拿不到
+// 第二视角。弹窗里 qwen3-vl-plus 既是推荐项又是默认复核模型，用户选它时
+// 复核会静默消失。这里直接跑真实模块，锁住避让行为。
+// ---------------------------------------------------------------------------
+
+const describeModule = require('../skills/docchain-image-describe/scripts/describe_images.js');
+
+function resolveWith(base, params) {
+  return describeModule.resolveVisionConfig(base, params);
+}
+
+const BASE = { url: 'https://example.test/v1', key: 'k' };
+
+test('用户选中的主模型与复核模型相同时，复核自动换一个不同的', () => {
+  const cfg = resolveWith(
+    { ...BASE, model: 'doubao-seed-2.0-pro', judgeModel: 'qwen3-vl-plus' },
+    { model: 'qwen3-vl-plus' },
+  );
+  assert.strictEqual(cfg.model, 'qwen3-vl-plus');
+  assert.notStrictEqual(cfg.judgeModel, cfg.model, '复核模型不能和主模型相同');
+  assert.strictEqual(cfg.judgeModel, 'doubao-seed-2.0-pro', '应换成默认复核模型');
+});
+
+test('主模型换成复核模型的默认值时，复核改走另一个推荐模型', () => {
+  // DEFAULT_VISION_JUDGE_MODEL 是 doubao，用户恰好选了它
+  const cfg = resolveWith(
+    { ...BASE, model: 'qwen3-vl-plus', judgeModel: 'doubao-seed-2.0-pro' },
+    { model: 'doubao-seed-2.0-pro' },
+  );
+  assert.strictEqual(cfg.model, 'doubao-seed-2.0-pro');
+  assert.notStrictEqual(cfg.judgeModel, cfg.model);
+  assert.ok(cfg.judgeModel.length > 0, '必须还能复核');
+});
+
+test('主模型本来就不冲突时，配置过的复核模型保持原样', () => {
+  const cfg = resolveWith(
+    { ...BASE, model: 'doubao-seed-2.0-pro', judgeModel: 'qwen3-vl-plus' },
+    { model: 'glm-5v-turbo' },
+  );
+  assert.strictEqual(cfg.model, 'glm-5v-turbo');
+  assert.strictEqual(cfg.judgeModel, 'qwen3-vl-plus', '不该无谓改动用户配置');
+});
+
+test('显式传空串表示"只读一遍"，避让逻辑不能把它复活', () => {
+  const cfg = resolveWith(
+    { ...BASE, model: 'doubao-seed-2.0-pro', judgeModel: 'qwen3-vl-plus' },
+    { model: 'qwen3-vl-plus', judgeModel: '' },
+  );
+  assert.strictEqual(cfg.judgeModel, '', '显式关闭必须保持关闭');
+});
+
+test('配置里留空不等于关闭复核：仍会回落到环境变量或默认值', () => {
+  // 原有语义：source.judgeModel 为空串是 falsy，会回落到环境变量/默认值。
+  // 要真正"只读一遍"必须通过 params.judgeModel 显式传空串（上一个用例）。
+  const saved = process.env.VISION_JUDGE_MODEL;
+  delete process.env.VISION_JUDGE_MODEL;
+  try {
+    const cfg = resolveWith({ ...BASE, model: 'a', judgeModel: '' }, { model: 'b' });
+    assert.strictEqual(cfg.judgeModel, 'doubao-seed-2.0-pro', '应回落到默认复核模型');
+    assert.notStrictEqual(cfg.judgeModel, cfg.model);
+  } finally {
+    if (saved !== undefined) process.env.VISION_JUDGE_MODEL = saved;
+  }
+});
+
+test('任意主模型下，复核模型都不会等于主模型', () => {
+  const candidates = [
+    'qwen3-vl-plus',
+    'doubao-seed-2.0-pro',
+    'glm-5v-turbo',
+    'gpt-4o',
+    'gemini-3-flash',
+  ];
+  for (const picked of candidates) {
+    const cfg = resolveWith(
+      { ...BASE, model: 'doubao-seed-2.0-pro', judgeModel: 'qwen3-vl-plus' },
+      { model: picked },
+    );
+    assert.notStrictEqual(
+      cfg.judgeModel,
+      cfg.model,
+      `主模型 ${picked} 时复核模型不该与它相同`,
+    );
+  }
+});
