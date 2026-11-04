@@ -631,28 +631,42 @@ function parseGraph(text) {
     }
     // 被丢掉的节点（patch 编号那类）要"短路"掉：把它的前驱直接接到它的后继上，
     // 否则 "Patch Embedding → 0…9 → Encoder" 这种主干会被拆成两截、图就断开了。
+    //
+    // 但短路造出来的是一段**推断**，原图里并没有这条边：
+    //   营销管理办公室 → [1] → 用户体验设计部   短路后变成
+    //   营销管理办公室 → 用户体验设计部
+    // 对组织架构图这种"图上编号被当噪声丢掉"的情形，等于凭空画出一条汇报线。
+    // 缺节点看得出来，多一条线看不出来，所以短路边一律打 speculated 标记，
+    // 渲染时画成虚线，并计入 speculatedEdges。
     const rawOut = new Map();
     for (const edge of rawEdges) {
         if (!rawOut.has(edge.from)) rawOut.set(edge.from, []);
         rawOut.get(edge.from).push(edge.to);
     }
+    // 返回 { ids, hops }：hops > 0 说明经过了被丢弃的节点，这条边是推断出来的。
     const resolveEnds = (id, depth) => {
         const mapped = idToCanonical.get(id);
-        if (mapped && ids.has(mapped)) return [mapped];
-        if (depth >= 2) return [];
+        if (mapped && ids.has(mapped)) return { ids: [mapped], hops: 0 };
+        if (depth >= 2) return { ids: [], hops: 0 };
         const next = rawOut.get(id) || [];
         // 只有"恰好一个后继"时才短路：被丢掉的若是扇形枢纽（一个父节点连 8 个子公司），
         // 展开会把兄弟节点两两连成网状假边（实测 6 个节点被连成 30 条边）。
-        if (next.length !== 1) return [];
-        return resolveEnds(next[0], depth + 1);
+        if (next.length !== 1) return { ids: [], hops: 0 };
+        const deeper = resolveEnds(next[0], depth + 1);
+        return { ids: deeper.ids, hops: deeper.hops + 1 };
     };
 
     const edges = [];
     const seenEdge = new Set();
     const fanoutOf = new Map();
+    let speculatedEdges = 0;
     for (const edge of rawEdges) {
-        for (const from of resolveEnds(edge.from, 0)) {
-            for (const to of resolveEnds(edge.to, 0)) {
+        const fromSide = resolveEnds(edge.from, 0);
+        const toSide = resolveEnds(edge.to, 0);
+        // 任一端经过被丢弃的节点，这条边就是推断出来的
+        const speculated = fromSide.hops > 0 || toSide.hops > 0;
+        for (const from of fromSide.ids) {
+            for (const to of toSide.ids) {
                 if (from === to) continue; // 合并/短路后产生的自环直接丢
                 // 注意：**不能**按"标签相同就不连"过滤 —— 连续的同类模块（VGG19 的三层 4096、
                 // 堆叠的 Add & Norm）本来就走同一条链，按标签删边会把它们整段拆断。
@@ -663,7 +677,12 @@ function parseGraph(text) {
                 const fanout = fanoutOf.get(from) || 0;
                 if (fanout >= DIAGRAM_MAX_FANOUT) continue;
                 fanoutOf.set(from, fanout + 1);
-                edges.push({ from, to, label: edge.label });
+                const record = { from, to, label: edge.label };
+                if (speculated) {
+                    record.speculated = true;
+                    speculatedEdges += 1;
+                }
+                edges.push(record);
             }
         }
         // 同理不按数量 break：边也要全部收进来，超限由 shrinkGraph 统一裁。
@@ -689,7 +708,16 @@ function parseGraph(text) {
     // 模型会把模板里的占位说明原样抄进 title（实测出现过 "图的标题，没有就空串"），
     // 那不是标题，画到图上只会是噪音。
     if (/图的标题|没有就空串|图的标题，/.test(title)) title = '';
-    return shrinkGraph({ title, nodes: keptNodes, edges: collapsed.edges });
+    const shrunk = shrinkGraph({ title, nodes: keptNodes, edges: collapsed.edges });
+    // mergeRedundantNodes 会重算边，推测标记按 (from,to) 传下去
+    const speculatedKeys = new Set(
+        edges.filter((edge) => edge.speculated).map((edge) => `${edge.from}>${edge.to}`),
+    );
+    for (const edge of shrunk.edges) {
+        if (!edge.speculated && speculatedKeys.has(`${edge.from}>${edge.to}`)) edge.speculated = true;
+    }
+    shrunk.speculatedEdges = shrunk.edges.filter((edge) => edge.speculated).length;
+    return shrunk;
 }
 
 /**
@@ -700,20 +728,30 @@ function parseGraph(text) {
  * 看着就像模型漏读。改成"从叶子节点里挑度最小的删"，各分支会被均匀保留，主干不受影响。
  */
 function shrinkGraph(graph) {
-    let current = graph;
+    if (!graph) return graph;
     const withinLimits = (g) => g.nodes.length <= DIAGRAM_MAX_NODES && g.edges.length <= DIAGRAM_MAX_EDGES;
+    const originalNodeCount = graph.nodes.length;
+    let current = graph;
     for (let guard = 0; guard < 400; guard += 1) {
-        if (withinLimits(current)) return current;
-        if (current.nodes.length <= DIAGRAM_MIN_NODES) return current;
+        if (withinLimits(current)) break;
+        if (current.nodes.length <= DIAGRAM_MIN_NODES) break;
         const victim = pickLeafVictim(current);
-        if (!victim) return current;
+        if (!victim) break;
         current = {
             title: current.title,
             nodes: current.nodes.filter((node) => node.id !== victim.id),
             edges: current.edges.filter((edge) => edge.from !== victim.id && edge.to !== victim.id),
+            // 推测边数由 parseGraph 挂在图上，裁剪过程中要一路带着
+            speculatedEdges: current.speculatedEdges,
         };
     }
-    return current;
+    // 裁掉多少必须写进结果：否则拿到图的人分不清"原图就这几个框"和"被砍到只剩这些"。
+    // 推测边也要按裁剪后的实际边重算——被删掉的那条不该再计数。
+    return {
+        ...current,
+        removedNodes: originalNodeCount - current.nodes.length,
+        speculatedEdges: current.edges.filter((edge) => edge.speculated).length,
+    };
 }
 
 /**
@@ -793,7 +831,10 @@ function renderPuml(graph) {
         const to = alias.get(edge.to);
         if (!from || !to) continue;
         const label = String(edge.label == null ? '' : edge.label).trim();
-        lines.push(label ? `${from} --> ${to} : ${sanitizePumlLabel(label)}` : `${from} --> ${to}`);
+        // 推测出来的边画虚线：它来自"被丢弃节点的前驱接后继"，原图并没有这条连线。
+        // 用实线画出来就等于告诉读者这是原图里的确定关系。
+        const arrow = edge.speculated ? '..>' : '-->';
+        lines.push(label ? `${from} ${arrow} ${to} : ${sanitizePumlLabel(label)}` : `${from} ${arrow} ${to}`);
     }
     lines.push('@enduml');
     return lines.join('\n');
@@ -932,19 +973,28 @@ function pickLeafVictim(graph) {
  * 只删叶子：删中间节点会把链断成两截，看起来就像逻辑错了。
  */
 function fitGraph(graph) {
+    if (!graph) return graph;
+    const inheritedRemoved = graph.removedNodes || 0;
+    const originalNodeCount = graph.nodes.length;
     let current = graph;
     for (let guard = 0; guard < 300 && current; guard += 1) {
-        if (renderPuml(current).length <= DIAGRAM_MAX_PUML_CHARS) return current;
-        if (current.nodes.length <= DIAGRAM_MIN_NODES) return current;
+        if (renderPuml(current).length <= DIAGRAM_MAX_PUML_CHARS) break;
+        if (current.nodes.length <= DIAGRAM_MIN_NODES) break;
         const victim = pickLeafVictim(current);
-        if (!victim) return current;
+        if (!victim) break;
         current = {
             title: current.title,
             nodes: current.nodes.filter((node) => node.id !== victim.id),
             edges: current.edges.filter((edge) => edge.from !== victim.id && edge.to !== victim.id),
+            speculatedEdges: current.speculatedEdges,
         };
     }
-    return current;
+    // 同 shrinkGraph：被字符上限砍掉的量也要记账，别让人以为图本来就这么小。
+    // 上游（shrinkGraph）已经裁掉的数量要一起带上，否则两次裁剪只报后一次。
+    return {
+        ...current,
+        removedNodes: inheritedRemoved + (originalNodeCount - current.nodes.length),
+    };
 }
 
 /**
@@ -1797,6 +1847,9 @@ async function describeOneImage(ref, visionConfig, ctx, position) {
                     ctx.diagramRendered += 1;
                     ctx.diagramNodes += fitted.nodes.length;
                     ctx.diagramEdges += fitted.edges.length;
+                    // 裁剪和推断都记账：拿到图的人要能分清"原图就这些框"和"被砍过/接过"。
+                    if (fitted.removedNodes) ctx.diagramTrimmed += fitted.removedNodes;
+                    if (fitted.speculatedEdges) ctx.diagramSpeculated += fitted.speculatedEdges;
                     return { ok: true, kind: 'diagram', puml, ms: out.ms };
                 }
             }
@@ -1969,6 +2022,10 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
         diagramFallback: 0,
         diagramNodes: 0,
         diagramEdges: 0,
+        // 被裁剪掉的节点总数：>0 说明草图和原图不一样，人工要回看原图
+        diagramTrimmed: 0,
+        // 推断出来的连线总数：>0 说明草图里有原图不存在的虚线关系
+        diagramSpeculated: 0,
         rateLimited: 0,
         truncated: 0,
         compressed: 0,
@@ -2028,6 +2085,17 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
     if (ctx.diagramFallback > 0) {
         warnings.push(`DIAGRAM_FALLBACK：${ctx.diagramFallback} 张图给了结构数据但用不了（截断/节点太少），已回退成描述注释`);
     }
+    // 裁剪与推断必须显式告知：两者都让草图与原图不再等价，但图上不容易看出来。
+    if (ctx.diagramTrimmed > 0) {
+        warnings.push(
+            `DIAGRAM_TRIMMED：草图为适配版面裁掉了 ${ctx.diagramTrimmed} 个节点（默认上限 ${DIAGRAM_MAX_NODES} 节点 / ${DIAGRAM_MAX_EDGES} 边、渲染 ${DIAGRAM_MAX_PUML_CHARS} 字符），原图比草图更全，请对照原图核对`,
+        );
+    }
+    if (ctx.diagramSpeculated > 0) {
+        warnings.push(
+            `DIAGRAM_SPECULATED：草图里有 ${ctx.diagramSpeculated} 条虚线连线是推断出来的（图上编号等节点被丢弃后由前驱直接接后继），原图并无该关系`,
+        );
+    }
     if (ctx.diagramMode !== 'off' && ctx.diagramRendered === 0 && descByKey.size > 0) {
         warnings.push('DIAGRAM_NONE：本次没有一张图产出结构草图（模型都按描述回答了）');
     }
@@ -2065,6 +2133,9 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
             fallback: ctx.diagramFallback,
             nodes: ctx.diagramNodes,
             edges: ctx.diagramEdges,
+            // 裁剪掉的节点总数与推断出的连线总数：非 0 说明草图 ≠ 原图，需对照原图
+            trimmed: ctx.diagramTrimmed,
+            speculated: ctx.diagramSpeculated,
             // 复核：dual 是做了二次读图的张数，agreed 是交集可用的张数（其余退回主模型）。
             judge_model: ctx.judgeModel || null,
             dual: ctx.diagramDual,
