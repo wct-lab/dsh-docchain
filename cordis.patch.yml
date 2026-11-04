@@ -3,14 +3,7 @@
     - id: dsh-docchain
       name: "dsh-docchain"
       config:
-        # 视觉模型候选，按综合能力从高到低。这里写多个而不是一个，是因为：
-        #   · 对话模型读不了图时，取第一个可用的当主模型；
-        #   · 结构图的复核模型取其中「可用且与主模型不同」的那个 —— 只配一个
-        #     的话，一旦主模型正好等于它，复核就会静默消失。
-        # 前三个是针对视觉任务训练的 VL 模型，且在真实文档上量过效果：
-        # qwen3-vl-plus 会把并列输入读成合并、doubao-seed-2.0-pro 会把连线
-        # 方向读反，两者取交集能压掉编造的边。后两个是金牌渠道的通用模型，
-        # 只为覆盖面补位。
-        # 改这里会影响所有装本插件的人；本机想覆盖，请在
-        # profiles/<name>/cordis.patch.yml 的 dsh-docchain 条目里再写一次。
+        # 视觉模型候选，按综合能力从高到低。第一个可用的当主模型兜底，
+        # 复核模型取其中第一个「可用且与主模型不同」的。
+        # 本机想覆盖：在本 profile 的 cordis.patch.yml 里再写一次即可。
         docchain_vision_candidates: qwen3-vl-plus,doubao-seed-2.0-pro,glm-5v-turbo,g-doubao-seed-2.1-pro,g-gpt-5.6-sol
