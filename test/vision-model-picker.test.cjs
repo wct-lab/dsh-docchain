@@ -225,22 +225,96 @@ test('userQuestions 挂在 exec 上（而非 agent）时同样可用', async () 
 // 不读图的模式不该弹窗
 // ---------------------------------------------------------------------------
 
-test('read / list_models 不读图，不该因为对话模型是纯文本就打断用户', () => {
+test('read / list_models / candidates / preview 都不读图，不该打断用户', () => {
   const fs = require('node:fs');
   const path = require('node:path');
   const src = fs.readFileSync(
     path.join(__dirname, '..', 'lib', 'tools', 'docchain.js'),
     'utf8',
   );
-  // read 只读旁路 md，list_models 只拉清单，两者都不调用视觉模型
+  // 四种模式都不调用视觉模型：读旁路 md、拉清单、只给 keyword 的候选、多篇待确认
   assert.ok(
-    /const needsVision = !args\.read && !args\.list_models/.test(src),
-    '应按 read/list_models 跳过视觉校验',
+    /const needsVision =\s*\n?\s*!args\.read && !args\.list_models && !isCandidates && !isPreview/.test(
+      src,
+    ),
+    '应按 read/list_models/candidates/preview 四者跳过视觉校验',
   );
   assert.ok(
     /if \(resolvedModel && needsVision\)/.test(src),
     '校验应以 needsVision 为前提',
   );
+});
+
+test('preview 与 candidates 的判断条件与脚本分流一致', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const tool = fs.readFileSync(
+    path.join(__dirname, '..', 'lib', 'tools', 'docchain.js'),
+    'utf8',
+  );
+  const script = fs.readFileSync(
+    path.join(__dirname, '..', 'skills', 'docchain-image-describe', 'scripts', 'describe_images.js'),
+    'utf8',
+  );
+  // 工具层
+  assert.ok(/const isCandidates = docs\.length === 0/.test(tool), '工具层缺 candidates 判断');
+  assert.ok(/const isPreview = docs\.length > 1 && !args\.confirm/.test(tool), '工具层缺 preview 判断');
+  // 脚本层分流（apply 顺序）
+  assert.ok(
+    /if \(docIds\.length === 0\) return doCandidates/.test(script),
+    '脚本层 candidates 分支变了',
+  );
+  assert.ok(
+    /if \(docIds\.length > 1 && !params\.confirm\) return doPreview/.test(script),
+    '脚本层 preview 分支变了',
+  );
+});
+
+test('只有真正要读图时才弹窗', () => {
+  // 复刻工具层判断（idList 无有效 ID 时返回 null → 兜成 []）
+  const decide = (args) => {
+    const raw = Array.isArray(args.doc_ids) ? args.doc_ids : null;
+    const docs = (raw || []).filter((x) => Number.isInteger(x) && x > 0);
+    const isCandidates = docs.length === 0;
+    const isPreview = docs.length > 1 && !args.confirm;
+    return !args.read && !args.list_models && !isCandidates && !isPreview;
+  };
+  assert.strictEqual(decide({ doc_ids: [130241] }), true, '单篇正式跑：要校验');
+  assert.strictEqual(decide({ doc_ids: [1, 2], confirm: true }), true, '多篇已确认：要校验');
+  assert.strictEqual(decide({ doc_ids: [1, 2] }), false, '多篇待确认：不校验');
+  assert.strictEqual(decide({ keyword: '大语言模型' }), false, '只给 keyword：不校验');
+  assert.strictEqual(decide({ doc_ids: [] }), false, '空列表：不校验');
+  assert.strictEqual(decide({ doc_ids: [130241], read: true }), false, 'read：不校验');
+  assert.strictEqual(decide({ list_models: true }), false, 'list_models：不校验');
+});
+
+test('doc_ids 缺失时不能崩（idList 返回 null，keyword 模式就是这种）', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'lib', 'tools', 'docchain.js'),
+    'utf8',
+  );
+  // 复刻 idList：无有效 ID 时返回 null
+  const idList = (value) => {
+    if (!Array.isArray(value)) return null;
+    const ids = value
+      .map((item) => (typeof item === 'number' ? item : Number(item)))
+      .filter((item) => Number.isInteger(item) && item > 0);
+    return ids.length ? ids : null;
+  };
+  assert.strictEqual(idList(undefined), null, '未传 doc_ids 时是 null');
+  assert.strictEqual(idList([]), null, '空数组也是 null');
+
+  // 直接对 null 取 .length 会抛 TypeError；工具里必须用 || [] 兜住
+  assert.ok(
+    /const docs = idList\(args\.doc_ids\) \|\| \[\]/.test(src),
+    'docs 必须对 null 兜底，否则 keyword 模式会抛 TypeError',
+  );
+  // 兜底后取 length 不抛
+  const docs = idList(undefined) || [];
+  assert.strictEqual(docs.length, 0);
+  assert.strictEqual(docs.length > 1 && !false, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -280,6 +354,53 @@ test('视觉模型只来自对话模型或用户点选，不存在第三条路�
     /skipVisionCheck/.test(src),
     false,
     'skipVisionCheck 后门必须删除',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 不要再把 max_images 当成"试跑"推销
+//
+// 试跑判断不出描述质量（工具不因此中止），只会让用户重复选一次视觉模型。
+// 模型的 max_images 参数描述和 SKILL.md 都已改掉这个建议，这里锁住它别回来。
+// ---------------------------------------------------------------------------
+
+test('工具描述不再建议"先用 2 试跑"', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'lib', 'tools', 'docchain.js'),
+    'utf8',
+  );
+  const start = src.indexOf("name: 'docchain_image_describe'");
+  const next = src.indexOf('const doc2markdownTool', start);
+  const block = src.slice(start, next > start ? next : start + 6000);
+  assert.strictEqual(
+    /建议先用 2 试跑/.test(block),
+    false,
+    'max_images 的参数描述不该再劝模型去试跑',
+  );
+  assert.ok(
+    /默认一次处理完整篇/.test(block),
+    '应明确默认一次跑完',
+  );
+});
+
+test('SKILL.md 不再把 max_images 当试跑手段推销', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const md = fs.readFileSync(
+    path.join(__dirname, '..', 'skills', 'docchain-image-describe', 'SKILL.md'),
+    'utf8',
+  );
+  assert.strictEqual(
+    /第一次建议先用 2 试跑/.test(md),
+    false,
+    'SKILL.md 参数表里不该再建议试跑',
+  );
+  assert.strictEqual(
+    /试跑两张/.test(md),
+    false,
+    'SKILL.md 用法示例里不该再把试跑列成常规步骤',
   );
 });
 
@@ -406,4 +527,52 @@ test('任意主模型下，复核模型都不会等于主模型', () => {
       `主模型 ${picked} 时复核模型不该与它相同`,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// 候选清单的单一真实来源
+//
+// 同一份 5 个模型出现在三个地方：插件自带的 cordis.patch.yml、index.js 的
+// DEFAULT_VISION_CANDIDATES、脚本的 DEFAULT_VISION_CANDIDATES。
+//
+// 为什么要三处：
+//   · 新装、没动过 profile 的人 → 走插件自带的 yml
+//   · 老用户（profile 里已配过 dsh-docchain）→ 配置层被整个替换，yml 那行
+//     读不到，落到代码常量。更新插件时代码会跟着更新，所以照样拿到新清单。
+//   · 想自定义的人 → 在自己 profile 里写 docchain_vision_candidates
+//
+// 三处必须完全一致，否则同一份插件在不同人机器上行为不同。改任何一处都要
+// 同步另外两处——这个测试就是用来拦住"只改了一处"的。
+// ---------------------------------------------------------------------------
+
+test('候选清单在插件 yml、index.js、脚本三处完全一致', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const root = path.join(__dirname, '..');
+
+  const fromScript = describeModule.DEFAULT_VISION_CANDIDATES;
+
+  const indexSrc = fs.readFileSync(path.join(root, 'index.js'), 'utf8');
+  const indexBlock = indexSrc.match(/DEFAULT_VISION_CANDIDATES = \[([\s\S]*?)\]/);
+  assert.ok(indexBlock, '找不到 index.js 的 DEFAULT_VISION_CANDIDATES');
+  const fromIndex = [...indexBlock[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+
+  const ymlSrc = fs.readFileSync(path.join(root, 'cordis.patch.yml'), 'utf8');
+  const ymlLine = ymlSrc.match(/docchain_vision_candidates:\s*(\S+)/);
+  assert.ok(ymlLine, '找不到 cordis.patch.yml 的候选配置');
+  const fromYml = ymlLine[1].split(',').map((s) => s.trim()).filter(Boolean);
+
+  assert.deepStrictEqual(fromIndex, fromScript, 'index.js 与脚本的候选清单不一致');
+  assert.deepStrictEqual(fromYml, fromScript, 'cordis.patch.yml 与脚本的候选清单不一致');
+});
+
+test('三处清单的顺序也一致（顺序就是优先级，不能只比集合）', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const root = path.join(__dirname, '..');
+  const fromScript = describeModule.DEFAULT_VISION_CANDIDATES;
+  const ymlSrc = fs.readFileSync(path.join(root, 'cordis.patch.yml'), 'utf8');
+  const fromYml = ymlSrc.match(/docchain_vision_candidates:\s*(\S+)/)[1].split(',');
+  assert.strictEqual(fromYml[0], fromScript[0], '第一个候选不一致，会改变主模型兜底');
+  assert.strictEqual(fromYml.length, fromScript.length, '数量不一致');
 });

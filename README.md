@@ -301,14 +301,13 @@ Reads the document's main markdown, hands each image to a multimodal model, inse
 **How to use it**:
 
 - "Turn every image in 125755 into text"
-- "Try 2 images first" (`max_images: 2`)
 - "Find documents named like…, I'll pick one" (`keyword` alone returns **candidates only** and processes nothing)
 - "Is 125755's description ready?" (`read: true`)
 - "Which vision models can this machine use?" (`list_models: true`)
 
 Things worth knowing:
 
-- **Time**: descriptions target information density (avg ~350–400 characters), so one image takes ~8–12 s. A structure image costs **3 calls** (classify + read + judge) and takes ~25–50 s; a description image costs **2** (classify + describe). Nine images measured 1–4 minutes (the gateway varies a lot). Run `max_images: 2` first to extrapolate.
+- **Time**: descriptions target information density (avg ~350–400 characters), so one image takes ~8–12 s. A structure image costs **3 calls** (classify + read + judge) and takes ~25–50 s; a description image costs **2** (classify + describe). Nine images measured 1–4 minutes (the gateway varies a lot). A document is processed in one pass by default; `max_images` is only for capping cost — it cannot tell you whether the descriptions are any good, and splitting the work in two makes the user pick a vision model twice.
 - **Classify first**: every image is first asked one question — structure or description — and is only allowed to answer a single word. The criterion is whether the **connector lines** carry the information: lines present and removing them loses the relationships → structure; layout infographics that rely on colour blocks / columns / side labels, or parallel lists whose boxes are not connected → description (even when there are many boxes). `diagram.structured` / `diagram.as_prose` report the two counts, `diagram.suspect` counts images classified as description that answered with graph data and were re-asked once, and `diagram.annotation_guard` counts images classified as structure whose node labels looked like layout annotations and were demoted back to a description.
 - **Same output shape for both kinds**: structure images become a `plantuml` block, everything else becomes a Chinese description comment. **Either way the original image is no longer embedded** — it becomes a single `[原图](url)` link you can click to compare.
 - **Suspect re-check**: only when an image was classified as description but its answer contained the graph signature `"nodes":` (it clearly saw a structure) is it re-asked with the structure prompt; if that yields a graph, the image is promoted to a sketch. Deliberately not done for every image, to avoid paying an extra call each time. Measured: 0 triggers across 14 images in two documents.
