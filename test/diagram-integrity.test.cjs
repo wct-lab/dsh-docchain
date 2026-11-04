@@ -217,3 +217,116 @@ test('推测边数在裁剪后按实际剩下的边重算', () => {
     '推测边数应等于裁剪后实际带标记的边数',
   );
 });
+// ---------------------------------------------------------------------------
+// P1-1：复核只比边方向，从不比节点集
+//
+// 两个模型都漏掉同一个部门时，没有任何一方会提出异议 —— 图上少画一个部门，
+// 等于在组织文件里凭空撤销它。缺节点比多一条线更危险：多一条线看得见，
+// 少一个部门是空白。
+//
+// 只告警、不改图：复核模型也可能幻觉出不存在的部门，贸然补进去等于制造新错误。
+// ---------------------------------------------------------------------------
+
+const NODES_8 = [
+  { id: 'root', label: '云智能经营中心' },
+  { id: 'a', label: '数据智能事业部' },
+  { id: 'b', label: '大模型创新部' },
+  { id: 'c', label: '云平台部' },
+  { id: 'd', label: '交付一部' },
+  { id: 'e', label: '交付二部' },
+  { id: 'f', label: '运营部' },
+  { id: 'g', label: '综合管理部' },
+];
+
+function graphOf(labels) {
+  const nodes = labels.map((label, i) => ({ id: `n${i}`, label }));
+  const edges = labels.slice(1).map((_, i) => ({ from: nodes[0].id, to: nodes[i + 1].id }));
+  return { title: 't', nodes, edges };
+}
+
+test('复核模型多认出节点时报出主模型的遗漏数', () => {
+  // 主模型漏了「电力事业部」「金融事业部」，复核模型看见了
+  const primary = graphOf([...NODES_8.slice(0, 6).map((n) => n.label)]);
+  const judge = graphOf([...NODES_8.slice(0, 6).map((n) => n.label), '电力事业部', '金融事业部']);
+  const merged = mod.subtractContradictions(primary, judge);
+  assert.ok(merged, '应该返回合并结果');
+  assert.strictEqual(
+    merged.missingFromPrimary,
+    2,
+    '复核多出的 2 个节点要记为主模型的遗漏',
+  );
+  // 只告警不改图：主模型的节点不该被凭空补进来
+  assert.strictEqual(
+    merged.nodes.length,
+    primary.nodes.length,
+    '方案 A：不改图，主模型节点数不变',
+  );
+});
+
+test('两边节点一致时遗漏数为 0', () => {
+  const g = graphOf(NODES_8.map((n) => n.label));
+  const merged = mod.subtractContradictions(g, graphOf(NODES_8.map((n) => n.label)));
+  assert.ok(merged);
+  assert.strictEqual(merged.missingFromPrimary, 0);
+});
+
+test('主模型多认出的节点单独统计，不算遗漏', () => {
+  const primary = graphOf([...NODES_8.slice(0, 6).map((n) => n.label), '电力事业部']);
+  const judge = graphOf(NODES_8.slice(0, 6).map((n) => n.label));
+  const merged = mod.subtractContradictions(primary, judge);
+  assert.ok(merged);
+  assert.strictEqual(merged.missingFromPrimary, 0, '主模型更全时不该报遗漏');
+  assert.strictEqual(merged.extraInPrimary, 1, '主模型独有的应单独计数');
+});
+
+// ---------------------------------------------------------------------------
+// P1-2：节点名被截断，但 truncated 从不增加
+//
+// 「郑州开发一团队」被截成「郑州开发一团」，尾字被吞，没有任何计数与警告。
+// 一个部门名被改名，工具毫无察觉。
+// ---------------------------------------------------------------------------
+
+test('节点名超长被截断时，统计出来并记下原名', () => {
+  const longName = '郑州开发一团队'; // 7 个字，不超 28 字符 → 不该截断
+  const veryLong = '超长部门名称'.repeat(10); // 远超 28 字符 → 会截断
+  const g = mod.parseGraph(
+    JSON.stringify({
+      nodes: [
+        { id: 'a', label: '根部门' },
+        { id: 'b', label: longName },
+        { id: 'c', label: veryLong },
+        { id: 'd', label: '另一个部门' },
+      ],
+      edges: [
+        { from: 'a', to: 'b' },
+        { from: 'a', to: 'c' },
+        { from: 'a', to: 'd' },
+      ],
+    }),
+  );
+  assert.ok(g, '应该能解析出图');
+  assert.ok(g.truncatedLabels && g.truncatedLabels.length >= 1, '应记录被截断的标签');
+  const hit = g.truncatedLabels.find((t) => t.original.startsWith('超长部门名称'));
+  assert.ok(hit, '应记下原名');
+  assert.ok(hit.shorter.length < hit.original.length, '截断后的名字应更短');
+});
+
+test('没有超长名字时不产生虚假的截断记录', () => {
+  const g = mod.parseGraph(
+    JSON.stringify({
+      nodes: [
+        { id: 'a', label: '根' },
+        { id: 'b', label: '短名字' },
+        { id: 'c', label: '郑州开发一团队' },
+        { id: 'd', label: '交付部' },
+      ],
+      edges: [
+        { from: 'a', to: 'b' },
+        { from: 'b', to: 'c' },
+        { from: 'c', to: 'd' },
+      ],
+    }),
+  );
+  assert.ok(g);
+  assert.strictEqual(g.truncatedLabels.length, 0, '都不超长就不该有记录');
+});

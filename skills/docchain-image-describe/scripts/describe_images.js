@@ -593,6 +593,8 @@ function parseGraph(text) {
 
     const nodes = [];
     const seen = new Set();
+    // 被截断的节点名：{ original, shorter }。数量与原名都要能回溯，否则名字被改了没人知道。
+    const truncatedLabels = [];
     // 不再按标签合并：原图里"Add & Norm"、"4096"这类同名框本来就重复出现（N 层堆叠），
     // 合并会把它压成一个模块 —— 那不是精简，是改意思。宁可多几个框。
     const idToCanonical = new Map();
@@ -610,8 +612,12 @@ function parseGraph(text) {
         seen.add(id);
         // 1–2 位序号、×N、纯符号是图上的编号/标注，不是模块：画出来就是一堆没意义的框。
         if (isNoiseLabel(rawLabel)) continue;
-        const label =
-            rawLabel.length > DIAGRAM_MAX_LABEL_CHARS ? truncateLabel(rawLabel, DIAGRAM_MAX_LABEL_CHARS) : rawLabel;
+        const wasTruncated = rawLabel.length > DIAGRAM_MAX_LABEL_CHARS;
+        const label = wasTruncated ? truncateLabel(rawLabel, DIAGRAM_MAX_LABEL_CHARS) : rawLabel;
+        // 截断会把部门名改掉（实测「郑州开发一团队」变成「郑州开发一团」，尾字被吞），
+        // 而 truncated 计数此前只统计描述文字、从不含节点名，等于悄悄改了名字。
+        // 这里把原名与截断后的名字都记下来，由调用方汇总告警。
+        if (wasTruncated) truncatedLabels.push({ original: rawLabel, shorter: label });
         idToCanonical.set(id, id);
         nodes.push({ id, label });
         // 这里**不**按数量截断：早先"够 20 个就 break"会按输入顺序砍掉整列叶子
@@ -717,6 +723,9 @@ function parseGraph(text) {
         if (!edge.speculated && speculatedKeys.has(`${edge.from}>${edge.to}`)) edge.speculated = true;
     }
     shrunk.speculatedEdges = shrunk.edges.filter((edge) => edge.speculated).length;
+    // 只保留仍然留在图上的那些（被裁掉的节点不必再提它的名字被截过）
+    const keptIds = new Set(shrunk.nodes.map((node) => node.label));
+    shrunk.truncatedLabels = truncatedLabels.filter((item) => keptIds.has(item.shorter));
     return shrunk;
 }
 
@@ -886,7 +895,36 @@ function subtractContradictions(primary, judge) {
     }
     const nodes = primary.nodes.filter((node) => used.has(node.id));
     if (nodes.length < DIAGRAM_MIN_NODES) return null;
-    return { title: primary.title, nodes, edges };
+
+    // 节点集比对（只告警，不改图）。
+    //
+    // 上面的逻辑只仲裁"边方向"，从不比较两个模型各认出多少个节点。两个模型都
+    // 漏掉同一个部门时，没有任何一方会提出异议 —— 图上少画一个部门，等于在组织
+    // 文件里凭空撤销它。缺节点比多一条线更危险：多一条线看得见，少一个部门是空白。
+    //
+    // 为什么不把复核多出的节点补进去：复核模型也可能幻觉出不存在的部门，贸然补
+    // 进去等于用一个未经验证的猜测制造新错误。这里只如实报告数量，由人判断。
+    const labelSet = (graph) =>
+        new Set(
+            (graph.nodes || [])
+                .map((node) => String(node.label == null ? '' : node.label).trim())
+                .filter(Boolean),
+        );
+    const primaryLabels = labelSet(primary);
+    const judgeLabels = labelSet(judge);
+    let missingFromPrimary = 0;
+    let extraInPrimary = 0;
+    for (const label of judgeLabels) if (!primaryLabels.has(label)) missingFromPrimary += 1;
+    for (const label of primaryLabels) if (!judgeLabels.has(label)) extraInPrimary += 1;
+
+    return {
+        title: primary.title,
+        nodes,
+        edges,
+        speculatedEdges: (primary.speculatedEdges || 0),
+        missingFromPrimary,
+        extraInPrimary,
+    };
 }
 
 /**
@@ -1850,6 +1888,17 @@ async function describeOneImage(ref, visionConfig, ctx, position) {
                     // 裁剪和推断都记账：拿到图的人要能分清"原图就这些框"和"被砍过/接过"。
                     if (fitted.removedNodes) ctx.diagramTrimmed += fitted.removedNodes;
                     if (fitted.speculatedEdges) ctx.diagramSpeculated += fitted.speculatedEdges;
+                    // 复核发现主模型漏认的节点：只告警不改图，由人判断。
+                    if (finalGraph.missingFromPrimary) {
+                        ctx.diagramMissingFromPrimary += finalGraph.missingFromPrimary;
+                    }
+                    // 节点名被截断（可能是部门名被改名），记原名供回溯。
+                    if (Array.isArray(fitted.truncatedLabels) && fitted.truncatedLabels.length) {
+                        ctx.diagramLabelsTruncated += fitted.truncatedLabels.length;
+                        for (const item of fitted.truncatedLabels) {
+                            if (ctx.diagramLabelSamples.length < 5) ctx.diagramLabelSamples.push(item);
+                        }
+                    }
                     return { ok: true, kind: 'diagram', puml, ms: out.ms };
                 }
             }
@@ -2026,6 +2075,11 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
         diagramTrimmed: 0,
         // 推断出来的连线总数：>0 说明草图里有原图不存在的虚线关系
         diagramSpeculated: 0,
+        // 复核发现主模型漏认的节点总数：>0 说明主模型少画了东西
+        diagramMissingFromPrimary: 0,
+        // 节点名被截断的总数，以及前几条样本（原文 → 截断后）
+        diagramLabelsTruncated: 0,
+        diagramLabelSamples: [],
         rateLimited: 0,
         truncated: 0,
         compressed: 0,
@@ -2096,6 +2150,21 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
             `DIAGRAM_SPECULATED：草图里有 ${ctx.diagramSpeculated} 条虚线连线是推断出来的（图上编号等节点被丢弃后由前驱直接接后继），原图并无该关系`,
         );
     }
+    // 主模型漏画节点：复核看见了、主模型没看见。缺节点是空白，比多一条线更难发现。
+    if (ctx.diagramMissingFromPrimary > 0) {
+        warnings.push(
+            `DIAGRAM_MISSING：复核模型比主模型多认出 ${ctx.diagramMissingFromPrimary} 个节点，主模型的草图可能漏画，请对照原图确认`,
+        );
+    }
+    // 节点名被截断：可能是部门名被改名，必须把原名还回去。
+    if (ctx.diagramLabelsTruncated > 0) {
+        const samples = ctx.diagramLabelSamples
+            .map((item) => `「${item.original}」→「${item.shorter}」`)
+            .join('；');
+        warnings.push(
+            `DIAGRAM_LABEL_TRUNCATED：${ctx.diagramLabelsTruncated} 个节点名超过 ${DIAGRAM_MAX_LABEL_CHARS} 字符被截断，名字可能被改意，示例：${samples}`,
+        );
+    }
     if (ctx.diagramMode !== 'off' && ctx.diagramRendered === 0 && descByKey.size > 0) {
         warnings.push('DIAGRAM_NONE：本次没有一张图产出结构草图（模型都按描述回答了）');
     }
@@ -2136,6 +2205,10 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
             // 裁剪掉的节点总数与推断出的连线总数：非 0 说明草图 ≠ 原图，需对照原图
             trimmed: ctx.diagramTrimmed,
             speculated: ctx.diagramSpeculated,
+            // 复核看见、主模型漏认的节点数：非 0 说明草图可能少画
+            missing_from_primary: ctx.diagramMissingFromPrimary,
+            // 被截断的节点名数量（原名见 warnings 里的 DIAGRAM_LABEL_TRUNCATED）
+            labels_truncated: ctx.diagramLabelsTruncated,
             // 复核：dual 是做了二次读图的张数，agreed 是交集可用的张数（其余退回主模型）。
             judge_model: ctx.judgeModel || null,
             dual: ctx.diagramDual,
