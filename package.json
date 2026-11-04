@@ -1,6 +1,6 @@
 {
   "name": "dsh-docchain",
-  "version": "1.10.0",
+  "version": "1.11.0",
   "private": true,
   "type": "module",
   "description": "DSH knowledge base and document conversion plugin: filename/content/metadata search, locate-by-doc_id/name with content reading, topic listing, bulk document upload, document-to-Markdown conversion, image-similarity search, per-document image descriptions written to a sidecar markdown, a deep-research workflow, and a knowledge-graph (Neo4j) layer — ontology inspection, read-only Cypher, and node/relation writes all go through the DocChain API (no Neo4j password needed). Every script-backed capability also ships as a native tool executed in-process; the configuration page keeps switchable docchain environments with per-environment topic selection",
