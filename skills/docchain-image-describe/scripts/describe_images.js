@@ -162,15 +162,37 @@ const DEFAULT_VISION_URL = 'https://lab.iwhalecloud.com/gpt-proxy/v1';
 const DEFAULT_VISION_MODEL = 'qwen3-vl-plus';
 const DEFAULT_VISION_FALLBACK = 'g-deepseek-v4-flash';
 /**
- * 复核模型：结构图读两遍（主模型 + 这个模型），只保留两边都认可的连线。
- * 实测不同模型的读图错误不重叠（qwen 读错输入合并、doubao 读错反向层），交集能压掉编造的边。
+ * 视觉模型候选，按综合能力从高到低。第一个可用的当主模型兜底，
+ * 复核模型取其中第一个「可用且与主模型不同」的。
+ *
+ * 前三个是针对视觉任务训练的 VL 模型，且在真实文档上量过效果：
+ * qwen3-vl-plus 会把并列输入读成合并、doubao-seed-2.0-pro 会把连线方向读反，
+ * 两者取交集能压掉编造的边。后两个是金牌渠道的通用模型，只为覆盖面补位。
+ *
+ * 与 index.js 的 DEFAULT_VISION_CANDIDATES 保持一致；实际以配置
+ * docchain_vision_candidates 为准，这里只是没人配置时的兜底。
  */
-const DEFAULT_VISION_JUDGE_MODEL = 'doubao-seed-2.0-pro';
-/**
- * 推荐视觉模型，按综合能力排序。工具层的弹窗按这个顺序列出来，
- * 复核模型撞车时也从这里挑替代。
- */
-const PREFERRED_VISION_MODELS = ['qwen3-vl-plus', 'doubao-seed-2.0-pro', 'glm-5v-turbo'];
+const DEFAULT_VISION_CANDIDATES = [
+    'qwen3-vl-plus',
+    'doubao-seed-2.0-pro',
+    'glm-5v-turbo',
+    'g-doubao-seed-2.1-pro',
+    'g-gpt-5.6-sol',
+];
+
+/** 去掉空串与重复项，保持原顺序；全空时回落到默认候选。 */
+function normalizeCandidates(input) {
+    const list = Array.isArray(input) ? input : String(input || '').split(',');
+    const seen = new Set();
+    const out = [];
+    for (const raw of list) {
+        const id = String(raw || '').trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        out.push(id);
+    }
+    return out.length > 0 ? out : DEFAULT_VISION_CANDIDATES.slice();
+}
 
 const ARG_SPEC = {
     doc_ids: { type: 'string', default: null },
@@ -316,7 +338,10 @@ function getConfig() {
                 process.env.VISION_FALLBACK_MODEL || config.docchain_vision_fallback_model || DEFAULT_VISION_FALLBACK,
             ),
             judgeModel: String(
-                process.env.VISION_JUDGE_MODEL || config.docchain_vision_judge_model || DEFAULT_VISION_JUDGE_MODEL,
+                process.env.VISION_JUDGE_MODEL || config.docchain_vision_judge_model || '',
+            ),
+            candidates: normalizeCandidates(
+                config.docchain_vision_candidates || DEFAULT_VISION_CANDIDATES,
             ),
             maxDescChars:
                 Number(process.env.VISION_MAX_DESC_CHARS || config.docchain_vision_max_desc_chars) || undefined,
@@ -1342,22 +1367,29 @@ function resolveVisionConfig(base, params) {
         .trim()
         .toLowerCase();
     const diagram = DIAGRAM_MODES.includes(diagramRaw) ? diagramRaw : DEFAULT_DIAGRAM_MODE;
-    // 复核模型：参数 > 配置 > 环境变量 > 默认值；显式传空串表示关闭（只读一遍）。
-    const judgeRaw =
-        params.judgeModel === undefined || params.judgeModel === null
-            ? source.judgeModel || process.env.VISION_JUDGE_MODEL || DEFAULT_VISION_JUDGE_MODEL
-            : params.judgeModel;
-    let judgeModel = String(judgeRaw || '').trim();
-    // 复核的意义在于"换一个模型再读一遍"，和主模型相同时拿不到第二视角，
-    // 调用方会直接跳过（见 describeOneImage）。用户在弹窗里挑了 qwen3-vl-plus
-    // 这类恰好等于复核模型的选项时，复核会静默消失，这里自动换一个不同的。
-    // 显式传空串是"只读一遍"的意思，不能被这里复活。
-    if (judgeModel && judgeModel === model) {
-        judgeModel = DEFAULT_VISION_JUDGE_MODEL !== model
-            ? DEFAULT_VISION_JUDGE_MODEL
-            : PREFERRED_VISION_MODELS.find((id) => id !== model) || '';
+    // 候选清单：参数 > 配置 > 默认值。顺序即优先级，第一个可用的当主模型兜底。
+    const candidates = normalizeCandidates(
+        params.candidates || source.candidates || DEFAULT_VISION_CANDIDATES,
+    );
+    // 复核模型：参数 > 配置 > 环境变量，都没有就从候选里挑。
+    // 显式传空串（params.judgeModel === ''）表示"只读一遍"，不再从候选里补。
+    const judgeExplicitlyOff =
+        params.judgeModel !== undefined && params.judgeModel !== null && !String(params.judgeModel).trim();
+    let judgeModel = '';
+    if (!judgeExplicitlyOff) {
+        const judgeRaw =
+            params.judgeModel === undefined || params.judgeModel === null
+                ? source.judgeModel || process.env.VISION_JUDGE_MODEL || ''
+                : params.judgeModel;
+        judgeModel = String(judgeRaw || '').trim();
     }
-    return { url, key, model, fallbackModel, maxDescChars, diagram, judgeModel };
+    // 复核的意义在于"换一个模型再读一遍"，和主模型相同时拿不到第二视角，
+    // 调用方会直接跳过（见 describeOneImage）。没配复核模型、或配的那个恰好
+    // 等于主模型时，从候选里换一个不同的。
+    if (!judgeExplicitlyOff && (!judgeModel || judgeModel === model)) {
+        judgeModel = candidates.find((id) => id !== model) || '';
+    }
+    return { url, key, model, fallbackModel, maxDescChars, diagram, judgeModel, candidates };
 }
 
 /**
@@ -2234,6 +2266,8 @@ module.exports = {
     SENTINEL,
     DEFAULT_CONCURRENCY,
     MAX_CONCURRENCY,
-    PREFERRED_VISION_MODELS,
+    PREFERRED_VISION_MODELS: DEFAULT_VISION_CANDIDATES,
+    DEFAULT_VISION_CANDIDATES,
+    normalizeCandidates,
     resolveVisionConfig,
 };

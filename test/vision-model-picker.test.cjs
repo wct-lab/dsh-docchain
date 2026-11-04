@@ -337,18 +337,54 @@ test('显式传空串表示"只读一遍"，避让逻辑不能把它复活', () 
   assert.strictEqual(cfg.judgeModel, '', '显式关闭必须保持关闭');
 });
 
-test('配置里留空不等于关闭复核：仍会回落到环境变量或默认值', () => {
-  // 原有语义：source.judgeModel 为空串是 falsy，会回落到环境变量/默认值。
-  // 要真正"只读一遍"必须通过 params.judgeModel 显式传空串（上一个用例）。
+test('没配复核模型时，从候选里挑一个与主模型不同的', () => {
+  // 新语义：judgeModel 不再有"单个默认值"，改为从候选列表里挑。
   const saved = process.env.VISION_JUDGE_MODEL;
   delete process.env.VISION_JUDGE_MODEL;
   try {
     const cfg = resolveWith({ ...BASE, model: 'a', judgeModel: '' }, { model: 'b' });
-    assert.strictEqual(cfg.judgeModel, 'doubao-seed-2.0-pro', '应回落到默认复核模型');
-    assert.notStrictEqual(cfg.judgeModel, cfg.model);
+    assert.ok(cfg.judgeModel, '应该挑出一个复核模型');
+    assert.notStrictEqual(cfg.judgeModel, cfg.model, '不能和主模型相同');
+    assert.ok(
+      describeModule.DEFAULT_VISION_CANDIDATES.includes(cfg.judgeModel),
+      '应从默认候选里挑',
+    );
   } finally {
     if (saved !== undefined) process.env.VISION_JUDGE_MODEL = saved;
   }
+});
+
+test('候选列表可覆盖：只留一个候选时，主模型撞上它就退化为不复核', () => {
+  // 环境变量优先级高于候选列表，会盖住这个用例的意图，先隔离掉。
+  const saved = process.env.VISION_JUDGE_MODEL;
+  delete process.env.VISION_JUDGE_MODEL;
+  try {
+    const cfg = resolveWith(
+      { ...BASE, model: 'x', judgeModel: '', candidates: ['solo-model'] },
+      { model: 'solo-model' },
+    );
+    assert.strictEqual(cfg.judgeModel, '', '没有别的候选可选时不该硬凑');
+  } finally {
+    if (saved !== undefined) process.env.VISION_JUDGE_MODEL = saved;
+  }
+});
+
+test('候选列表会去重、去空串，顺序保持不变', () => {
+  const got = describeModule.normalizeCandidates(
+    'a, b , a,,c ,  b',
+  );
+  assert.deepStrictEqual(got, ['a', 'b', 'c']);
+});
+
+test('候选全空时回落到默认清单，不会出现空列表', () => {
+  assert.deepStrictEqual(
+    describeModule.normalizeCandidates(''),
+    describeModule.DEFAULT_VISION_CANDIDATES,
+  );
+  assert.deepStrictEqual(
+    describeModule.normalizeCandidates(' , , '),
+    describeModule.DEFAULT_VISION_CANDIDATES,
+  );
 });
 
 test('任意主模型下，复核模型都不会等于主模型', () => {

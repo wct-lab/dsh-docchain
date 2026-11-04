@@ -76,6 +76,27 @@ export const DEFAULT_VISION_KEY_REF = "IWHALE_API_KEY";
 export const DEFAULT_VISION_URL = "https://lab.iwhalecloud.com/gpt-proxy/v1";
 /** Default vision model: a VL-specific model; measured best on Chinese charts. */
 export const DEFAULT_VISION_MODEL = "qwen3-vl-plus";
+/**
+ * Vision model candidates, ordered by overall capability.
+ *
+ * The first usable one becomes the primary model when the chat model cannot
+ * read images; the judge is the first one that is usable AND differs from the
+ * primary (the same model read twice yields no second opinion).
+ *
+ * The first three are VL-specific models with measured behaviour on real
+ * documents — qwen3-vl-plus merges parallel inputs while doubao-seed-2.0-pro
+ * flips edge directions, so their intersection drops invented edges. The last
+ * two are gold-tier general models, kept for breadth rather than proven chart
+ * accuracy. Override with `docchain_vision_candidates`; this list only applies
+ * when nothing is configured.
+ */
+export const DEFAULT_VISION_CANDIDATES = [
+  "qwen3-vl-plus",
+  "doubao-seed-2.0-pro",
+  "glm-5v-turbo",
+  "g-doubao-seed-2.1-pro",
+  "g-gpt-5.6-sol",
+];
 /** Fallback when the primary model is not enabled for the account. */
 export const DEFAULT_VISION_FALLBACK_MODEL = "g-deepseek-v4-flash";
 /** Default cap on one description (characters); keeps one image = one line. */
@@ -145,7 +166,15 @@ export const Config = z.object({
     .string()
     .volatile()
     .description(
-      '结构图的复核模型：同一张图读两遍，只删掉两边方向相反的连线、其余保留。默认 doubao-seed-2.0-pro；留空表示只读一遍',
+      '结构图的复核模型：同一张图读两遍，只删掉两边方向相反的连线、其余保留。默认取 docchain_vision_candidates 里第一个与主模型不同的；留空表示只读一遍',
+    ),
+  docchain_vision_candidates: z
+    .string()
+    .volatile()
+    .description(
+      '视觉模型候选清单（逗号分隔，按综合能力从高到低）。对话模型读不了图时用第一个可用的当主模型；' +
+        '复核模型取其中第一个「可用且与主模型不同」的。默认 ' +
+        DEFAULT_VISION_CANDIDATES.join(','),
     ),
   neo4j_uri: z
     .string()
@@ -278,6 +307,26 @@ function collectRefs(config, logger) {
 /** The credential-reference name the row resolves its vision-model key from. */
 function visionKeyRefName(config) {
   return readField(config, "docchain_vision_key_ref") || DEFAULT_VISION_KEY_REF;
+}
+
+/**
+ * Parse the comma-separated vision-model candidate list.
+ *
+ * Empty or missing falls back to DEFAULT_VISION_CANDIDATES; a value that parses
+ * to nothing usable also falls back, so a typo in the config cannot leave the
+ * plugin with no models at all. De-duplicates while keeping order.
+ */
+function parseCandidates(raw) {
+  const text = typeof raw === "string" ? raw : "";
+  const seen = new Set();
+  const out = [];
+  for (const part of text.split(",")) {
+    const id = part.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out.length > 0 ? out : DEFAULT_VISION_CANDIDATES.slice();
 }
 
 /** Send one JSON answer; every outcome of the topic route goes through here. */
@@ -624,6 +673,8 @@ async function resolveToolServiceConfig(ctx, config) {
         process.env.VISION_JUDGE_MODEL !== undefined
           ? process.env.VISION_JUDGE_MODEL
           : readField(config, "docchain_vision_judge_model") || undefined,
+      // 候选清单：配置 > 默认值。逗号分隔，顺序即优先级。
+      candidates: parseCandidates(readField(config, "docchain_vision_candidates")),
       key: visionKey,
       keyRef: visionRef,
     },

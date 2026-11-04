@@ -325,12 +325,19 @@ Things worth knowing:
 - **Size**: 185 images produce roughly a 1.4 MB description markdown; above 400 images the result carries a `LARGE_PAYLOAD` warning.
 - **Descriptions are model readings**: dense tables and formulas can be misread — check the original image for critical numbers.
 
-**Vision model configuration**: the image-description model **follows the model you pick in the chat**, and the tool has no `model` argument — nothing can silently substitute one. If your chat model cannot read images, the tool pauses and asks you to pick a vision model from the gateway list (the first few are `qwen3-vl-plus`, `doubao-seed-2.0-pro`, `glm-5v-turbo`, ordered by overall capability); that pick applies to **this call only** and never changes your chat model. The fields below are the fallback used when no chat model can be resolved. Defaults to `https://lab.iwhalecloud.com/gpt-proxy/v1` with `qwen3-vl-plus` as the primary model and `doubao-seed-2.0-pro` as the judge, keyed by the `IWHALE_API_KEY` credential. To change endpoint or length cap, edit these fields (the configuration page does not render inputs for them):
+**Vision model configuration**: the image-description model **follows the model you pick in the chat**, and the tool has no `model` argument — nothing can silently substitute one. If your chat model cannot read images, the tool pauses and asks you to pick a vision model from the gateway list; that pick applies to **this call only** and never changes your chat model. The fields below are the fallback used when no chat model can be resolved. Defaults to `https://lab.iwhalecloud.com/gpt-proxy/v1`, keyed by the `IWHALE_API_KEY` credential. To change endpoint or length cap, edit these fields (the configuration page does not render inputs for them):
 
 ```yaml
 docchain_vision_url: https://lab.iwhalecloud.com/gpt-proxy/v1
 docchain_vision_model: qwen3-vl-plus               # fallback only: used when no chat model resolves
-docchain_vision_judge_model: doubao-seed-2.0-pro    # judge: second read for structure diagrams; empty = read once
+docchain_vision_candidates: qwen3-vl-plus,doubao-seed-2.0-pro,glm-5v-turbo,g-doubao-seed-2.1-pro,g-gpt-5.6-sol
+                                                  # comma-separated, best first. The first usable one is the
+                                                  # fallback primary; the judge is the first usable one that
+                                                  # differs from the primary (reading with the same model twice
+                                                  # gives no second opinion). Shipped in this plugin's own
+                                                  # cordis.patch.yml, so a fresh install already has it.
+docchain_vision_judge_model:                      # leave empty to let the candidate list choose the judge.
+                                                  # Set it explicitly to "" to read once (no judge).
 docchain_vision_fallback_model: g-deepseek-v4-flash   # used once when the primary model is unavailable
 docchain_vision_key_ref: IWHALE_API_KEY               # credential reference name
 docchain_vision_max_desc_chars: 1200                  # per-description character cap
