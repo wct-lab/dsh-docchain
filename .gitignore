@@ -11,3 +11,7 @@ node_modules/
 # Local docchain credentials/config (never commit real keys)
 skills/docchain_config.json
 **/scripts/config.json
+
+# 图片描述自测时下载到仓库根的文档图片
+doc*_*.png
+doc*_*.jpg
