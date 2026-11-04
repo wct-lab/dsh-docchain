@@ -855,9 +855,11 @@ export function apply(ctx, config) {
   // `ctx.inject` so a host without the tool registry still keeps the skill
   // provider, the projection file and the configuration page instead of
   // deactivating this plugin entirely.
+  // `userQuestions` is optional: image_describe uses it to let the user pick a
+  // vision model when the current chat model cannot read images.
   let disposeTools;
   let disposeKgTools;
-  ctx.inject(["tools"], (scope) => {
+  ctx.inject(["tools", "userQuestions"], (scope) => {
     scope.effect(() => {
       try {
         const dispose = registerDocchainTools(scope, () => resolveToolServiceConfig(ctx, config));

@@ -325,12 +325,12 @@ Bundle 插入一个 Host 插件（`dsh-docchain`），激活时在 `ctx.skills` 
 - **体积**：185 张图的描述 md 约 1.4 MB；>400 张图会提示 `LARGE_PAYLOAD`；
 - **描述是模型读图的结果**，密集表格与公式可能误读，关键数据请回看原图。
 
-**视觉模型配置**：默认 `https://lab.iwhalecloud.com/gpt-proxy/v1` + `doubao-seed-2.0-pro`（主）+ `qwen3-vl-plus`（复核），Key 取凭据库的 `IWHALE_API_KEY`。要换模型/地址/长度上限，改这几个字段（配置页不渲染输入框，改设置文档即可）：
+**视觉模型配置**：读图用的模型**跟随你在对话里选的那个**，工具没有 `model` 参数，没有任何东西能悄悄替换它。当前对话模型读不了图时，工具会暂停并让你从网关清单里点选一个视觉模型（前几个是 `qwen3-vl-plus`、`doubao-seed-2.0-pro`、`glm-5v-turbo`，按综合能力排序），**选择只对本次调用生效，不改你的对话模型**。下面的字段是"取不到对话模型"时的兜底。默认 `https://lab.iwhalecloud.com/gpt-proxy/v1` + `qwen3-vl-plus`（主）+ `doubao-seed-2.0-pro`（复核），Key 取凭据库的 `IWHALE_API_KEY`。要换地址/长度上限，改这几个字段（配置页不渲染输入框，改设置文档即可）：
 
 ```yaml
 docchain_vision_url: https://lab.iwhalecloud.com/gpt-proxy/v1
-docchain_vision_model: doubao-seed-2.0-pro         # 主模型：读图 + 写描述
-docchain_vision_judge_model: qwen3-vl-plus          # 复核模型：结构图读第二遍，只删方向矛盾的边；留空=只读一遍
+docchain_vision_model: qwen3-vl-plus               # 兜底：取不到对话模型时才用
+docchain_vision_judge_model: doubao-seed-2.0-pro    # 复核模型：结构图读第二遍，只删方向矛盾的边；留空=只读一遍
 docchain_vision_fallback_model: g-deepseek-v4-flash   # 主模型不可用时自动降级一次
 docchain_vision_key_ref: IWHALE_API_KEY               # 凭据引用名
 docchain_vision_max_desc_chars: 1200                  # 单条描述字数上限（超出按句末截断）
