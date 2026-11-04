@@ -443,7 +443,8 @@ test('subtractContradictions 删除后剩太少就返回 null（调用方退回�
 test('fitGraph 把过长的草图裁到上限内，且只删叶子节点（不断链）', () => {
   const nodes = [];
   const edges = [];
-  for (let i = 1; i <= 20; i += 1) {
+  // 字符上限放宽到 6000 后，100 个节点（约 5000 字符）也撞不到，改用 120 个（约 6100 字符）
+  for (let i = 1; i <= 120; i += 1) {
     nodes.push({ id: `n${i}`, label: `模块${i}的名字写得很长很长很长的样子` });
     if (i > 1) edges.push({ from: `n${i - 1}`, to: `n${i}`, label: '' });
   }
@@ -543,22 +544,27 @@ test('buildKindPrompt 把"必须有连接线"作为结构图的硬门槛', () =>
 });
 
 test('裁剪优先削最底层：顶层并排的中心一个都不能少', () => {
-  // 真实踩坑：浩鲸科技 → 8 个中心 → 某中心下 6 部门 → 每部门 6 团队。
+  // 真实踩坑：浩鲸科技 → 8 个中心 → 某中心下 8 部门 → 每部门 6 团队。
   // 早先按"兄弟最多优先"删，把根下面 8 个浅层叶子中心删掉了两个。
+  // 节点上限放宽到 80 后，6 部门 × 6 团队（共 51 节点）、8 × 6（65 节点）都撞不到，
+  // 改用 8 部门 × 8 团队 = 81 节点。
+  const DEPTS = 8;
+  const TEAMS_PER_DEPT = 8;
   const nodes = [{ id: 'root', label: '浩鲸科技' }];
   const edges = [];
   for (let i = 1; i <= 8; i += 1) {
     nodes.push({ id: `c${i}`, label: `中心${i}` });
     edges.push({ from: 'root', to: `c${i}`, label: '' });
   }
-  for (let d = 1; d <= 6; d += 1) {
+  for (let d = 1; d <= DEPTS; d += 1) {
     nodes.push({ id: `d${d}`, label: `部门${d}` });
     edges.push({ from: 'c4', to: `d${d}`, label: '' });
-    for (let t = 1; t <= 6; t += 1) {
+    for (let t = 1; t <= TEAMS_PER_DEPT; t += 1) {
       nodes.push({ id: `d${d}t${t}`, label: `团队${d}-${t}` });
       edges.push({ from: `d${d}`, to: `d${d}t${t}`, label: '' });
     }
   }
+  assert.ok(nodes.length > mod.DIAGRAM_MAX_NODES, '构造的图要超过节点上限才有意义');
   const shrunk = mod.shrinkGraph({ title: '', nodes, edges });
   assert.ok(shrunk.nodes.length <= mod.DIAGRAM_MAX_NODES);
   for (let i = 1; i <= 8; i += 1) {
@@ -566,7 +572,7 @@ test('裁剪优先削最底层：顶层并排的中心一个都不能少', () =>
   }
   // 被削掉的应该是末端团队，而不是上层
   const teams = shrunk.nodes.filter((n) => /^d\d+t\d+$/.test(n.id)).length;
-  assert.ok(teams < 36, '应该削掉了一部分末端团队');
+  assert.ok(teams < DEPTS * TEAMS_PER_DEPT, '应该削掉了一部分末端团队');
 });
 
 test('注入前先剥掉主 md 里的旧 image-desc 注释，避免叠层', () => {

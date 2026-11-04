@@ -77,10 +77,19 @@ const DEFAULT_DIAGRAM_MODE = 'on';
  *
  * 早期为了图小，把上限压到 12 节点 / 16 字 / 扇出 5，结果是把原图的结构砍掉一半
  * （实测 VGG19 的三层 4096 全丢、N 层堆叠被合并成一个模块），看起来就像"模型在总结"。
- * 现在放宽到接近提示词给的上限：宁可图大，不可失真。
+ *
+ * 为什么又提到 80 / 140 / 6000（原来 28 / 48 / 860）：
+ * 产出的 PlantUML **是给对话助手读的代码**，不是给人看的配图。删掉一个节点，
+ * 助手就永远不知道那个部门存在 —— 一份 41 节点的组织架构图曾被裁到 24 个，
+ * 13 个团队在产物里一个字都不剩，而助手会据此回答"只有 11 个部门"。
+ * 860 字符这条尤其错得离谱：它比节点上限更早触发（约 24 个短名字节点就撞上），
+ * 而它本来只是为了"渲染出来的图别溢出窄栏"。宁可图大、代码长，绝不丢结构。
+ *
+ * 取 80 是因为实测一份三层组织架构（1 根 + 8 中心 + 每中心 5 部门 + 部分挂团队）
+ * 恰好落在 60~62 节点，60 的线会把真实图切掉一两个；80 留出余量。
  */
-const DIAGRAM_MAX_NODES = 28;
-const DIAGRAM_MAX_EDGES = 48;
+const DIAGRAM_MAX_NODES = 80;
+const DIAGRAM_MAX_EDGES = 140;
 const DIAGRAM_MAX_LABEL_CHARS = 28;
 /** 一个节点最多画几条出边：只挡"放射状糊成一团"的极端情况。 */
 const DIAGRAM_MAX_FANOUT = 8;
@@ -106,10 +115,13 @@ function isNoiseLabel(text) {
 const DIAGRAM_MIN_NODES = 3;
 const DIAGRAM_MIN_EDGES = 2;
 /**
- * 结构图那次调用的 token 上限：要输出 20 个节点 + 40 条边的 JSON，比一段描述长得多。
- * 撞上限会被截断成半个 JSON，而半个 JSON 只能回退成散文 —— 所以给足余量。
+ * 结构图那次调用的 token 上限。
+ *
+ * 节点上限放宽到 60 之后，60 节点 + 100 条边、名字拉满 28 字时 JSON 约 3800 token，
+ * 原来的 3200 会被截断。而截断的后果很重：半个 JSON 解析不了，整张图只能回退成散文，
+ * 草图直接没了。所以按"允许的最大图 + 富余"给到 8000（网关侧该模型上限 256K，不紧张）。
  */
-const DIAGRAM_MAX_TOKENS = 3200;
+const DIAGRAM_MAX_TOKENS = 8000;
 /**
  * 草图的落盘方式：```plantuml 代码围栏。
  *
@@ -945,10 +957,16 @@ function truncateLabel(text, limit) {
 /**
  * 一段草图渲染后的字符上限。
  *
- * 实测：846 字符能渲染，886 字符渲染不出来 —— 边界落在 850~880 之间。
- * 取 860 留一点余量，宁可少保留一两个末端节点，也不能整段画不出来。
+ * 原来取 860，依据是"846 字节能渲染、886 字符渲染不出来"。实测下来那个边界
+ * 站不住：把不同规模的草图丢给 PlantUML 官方服务器，2110 字符（60 节点）和
+ * 5412 字符（150 节点）都能正常出 SVG。当时看到的失败更可能是特定渲染容器的
+ * 显示限制，或者网络超时，而不是 PlantUML 画不出来。
+ *
+ * 而这个上限的代价是实打实的：产出是给对话助手读的代码，删一个节点，助手就
+ * 永远不知道那个部门存在。所以放宽到 6000，只当"防爆"兜底，防止极端输入生成
+ * 几十 KB 的代码。实测 80 节点、名字拉满 28 字时约 4900 字符，仍在 6000 以内。
  */
-const DIAGRAM_MAX_PUML_CHARS = 860;
+const DIAGRAM_MAX_PUML_CHARS = 6000;
 
 /**
  * 挑一个"最该删"的叶子节点。
@@ -2406,6 +2424,7 @@ module.exports = {
     DIAGRAM_MAX_EDGES,
     DIAGRAM_MAX_LABEL_CHARS,
     DIAGRAM_MAX_PUML_CHARS,
+    DIAGRAM_MAX_TOKENS,
     DEFAULT_DIAGRAM_MODE,
     SENTINEL,
     DEFAULT_CONCURRENCY,

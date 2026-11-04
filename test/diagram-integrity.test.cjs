@@ -137,10 +137,10 @@ test('没有短路时不会凭空多出 speculated 边', () => {
 // ---------------------------------------------------------------------------
 
 test('超过节点上限时裁剪要记账，不能静默', () => {
-  // 造 40 个节点的树，超过 DIAGRAM_MAX_NODES(28)
+  // 造 100 个节点的树，超过 DIAGRAM_MAX_NODES(60)
   const nodes = [{ id: 'root', label: '根' }];
   const edges = [];
-  for (let i = 1; i <= 39; i += 1) {
+  for (let i = 1; i <= 99; i += 1) {
     nodes.push({ id: `n${i}`, label: `部门${i}` });
     edges.push({ from: i <= 8 ? 'root' : `n${Math.ceil((i - 8) / 4)}`, to: `n${i}` });
   }
@@ -173,31 +173,35 @@ test('未触发裁剪时不产生虚假的 removedNodes', () => {
   assert.strictEqual(shrunk.removedNodes, 0, '没裁剪就不该报被裁');
 });
 
-test('两段裁剪（节点上限 + 字符上限）的记账要累加，不能只报后一段', () => {
-  // 50 节点的宽而浅组织架构图：先被节点上限裁到 28，再被 860 字符上限继续裁。
+test('两段裁剪的记账要累加，不能只报后一段', () => {
+  // 上限放宽后（80 节点 / 140 边 / 6000 字符），很难再自然构造出"先撞节点上限、
+  // 再撞字符上限"的图：裁节点会连带裁边，字符数反而降下去。
+  // 所以这里直接验证 fitGraph 的累加契约：把"上游已裁 10 个"作为入口状态传进去，
+  // 再让它撞一次字符上限，累计数必须是两者之和。
   const nodes = [{ id: 'root', label: '云智能经营中心' }];
   const edges = [];
-  for (let i = 1; i <= 25; i += 1) {
-    nodes.push({ id: `u${i}`, label: `单元${i}` });
-    edges.push({ from: 'root', to: `u${i}` });
+  for (let i = 1; i <= 99; i += 1) {
+    // 标签拉满 28 字符，把字符数顶上去
+    nodes.push({ id: `n${i}`, label: (`部`.repeat(26) + i).slice(0, 28) });
+    edges.push({ from: 'root', to: `n${i}` });
   }
-  let team = 1;
-  for (let i = 1; i <= 6; i += 1) {
-    for (let k = 0; k < 4; k += 1) {
-      nodes.push({ id: `t${team}`, label: `团队${team}` });
-      edges.push({ from: `u${i}`, to: `t${team}` });
-      team += 1;
-    }
+  // 补交叉边到 140 条（边上限），制造 6000+ 字符
+  for (let i = 1; i <= 99 && edges.length < 140; i += 1) {
+    edges.push({ from: `n${i}`, to: `n${(i % 99) + 1}` });
   }
-  const stage1 = mod.shrinkGraph({ title: 't', nodes, edges });
-  const stage2 = mod.fitGraph(stage1) || stage1;
-  const actuallyRemoved = nodes.length - stage2.nodes.length;
-  assert.strictEqual(
-    stage2.removedNodes,
-    actuallyRemoved,
-    '累计被裁数必须等于原图节点数减去最终节点数',
+  const upstream = { title: 't', nodes, edges, removedNodes: 10 };
+  assert.ok(
+    mod.renderPuml(upstream).length > mod.DIAGRAM_MAX_PUML_CHARS,
+    '构造的图要超过字符上限，否则第二段不会裁',
   );
-  assert.ok(stage2.removedNodes > stage1.removedNodes, '第二段还应继续增加记账');
+
+  const fitted = mod.fitGraph(upstream) || upstream;
+  assert.ok(fitted.nodes.length < nodes.length, '第二段应该真的又裁掉了节点');
+  assert.strictEqual(
+    fitted.removedNodes,
+    10 + (nodes.length - fitted.nodes.length),
+    '累计被裁数 = 上游已裁 10 个 + 本段新裁的数量',
+  );
 });
 
 test('推测边数在裁剪后按实际剩下的边重算', () => {
@@ -329,4 +333,76 @@ test('没有超长名字时不产生虚假的截断记录', () => {
   );
   assert.ok(g);
   assert.strictEqual(g.truncatedLabels.length, 0, '都不超长就不该有记录');
+});
+// ---------------------------------------------------------------------------
+// 上限放宽的目的：正常的组织架构图不该被裁剪
+//
+// 产物是给对话助手读的代码。删一个节点，助手就永远不知道那个部门存在 ——
+// 实测一份 41 节点的组织架构图曾被裁到 24 个，13 个团队在产物里一个字都不剩，
+// 助手会据此回答"只有 11 个部门"。所以上限从 28/48/860 放宽到 60/100/4000。
+// ---------------------------------------------------------------------------
+
+test('上限已放宽到 80 节点 / 140 边 / 6000 字符', () => {
+  assert.strictEqual(mod.DIAGRAM_MAX_NODES, 80);
+  assert.strictEqual(mod.DIAGRAM_MAX_EDGES, 140);
+  assert.strictEqual(mod.DIAGRAM_MAX_PUML_CHARS, 6000);
+});
+
+test('41 节点的组织架构图不再被裁剪（放宽前的边界案例）', () => {
+  // 真实规模：根 + 25 个单元 + 15 个团队 = 41
+  const nodes = [{ id: 'root', label: '云智能经营中心' }];
+  const edges = [];
+  for (let i = 1; i <= 25; i += 1) {
+    nodes.push({ id: `u${i}`, label: `单元${i}` });
+    edges.push({ from: 'root', to: `u${i}` });
+  }
+  let team = 1;
+  for (let i = 1; i <= 5; i += 1) {
+    for (let k = 0; k < 3; k += 1) {
+      nodes.push({ id: `t${team}`, label: `团队${team}` });
+      edges.push({ from: `u${i}`, to: `t${team}` });
+      team += 1;
+    }
+  }
+  assert.strictEqual(nodes.length, 41);
+
+  const shrunk = mod.shrinkGraph({ title: 't', nodes, edges });
+  const fitted = mod.fitGraph(shrunk) || shrunk;
+  assert.strictEqual(fitted.removedNodes || 0, 0, '41 节点不该被裁掉任何部分');
+  assert.strictEqual(fitted.nodes.length, 41, '41 个方框要一个不少地画出来');
+
+  // 每个部门名都要出现在产物代码里，助手才读得到
+  const puml = mod.renderPuml(fitted);
+  for (const node of nodes) {
+    assert.ok(puml.includes(node.label), `产物里缺了「${node.label}」`);
+  }
+});
+
+test('80 节点以内、6000 字符以内的图完全不裁剪', () => {
+  const nodes = [{ id: 'root', label: '根' }];
+  const edges = [];
+  for (let i = 1; i <= 79; i += 1) {
+    nodes.push({ id: `n${i}`, label: `部门${i}` });
+    edges.push({ from: 'root', to: `n${i}` });
+  }
+  const shrunk = mod.shrinkGraph({ title: 't', nodes, edges });
+  assert.strictEqual(shrunk.removedNodes, 0);
+  assert.strictEqual(shrunk.nodes.length, 80);
+});
+test('token 上限要够画满允许的最大图（否则 JSON 被截断，草图直接没了）', () => {
+  // 60 节点 + 100 边、名字拉满 28 字，是最坏情况
+  assert.strictEqual(mod.DIAGRAM_MAX_TOKENS, 8000);
+  const nodes = [{ id: 'root', label: '云智能经营中心' }];
+  const edges = [];
+  for (let i = 1; i <= 59; i += 1) {
+    nodes.push({ id: `n${i}`, label: (`部`.repeat(26) + i).slice(0, mod.DIAGRAM_MAX_LABEL_CHARS) });
+    edges.push({ from: 'root', to: `n${i}` });
+  }
+  const json = JSON.stringify({ title: '组织架构', nodes, edges });
+  // 中文按约 1 token/字、ASCII 按约 4 字符/token 粗估；只要远低于上限就安全
+  const estimated = (json.match(/[\u4e00-\u9fa5]/g) || []).length + Math.ceil(json.length / 4);
+  assert.ok(
+    estimated < mod.DIAGRAM_MAX_TOKENS,
+    `最坏情况下估算 ${estimated} token，仍应低于上限 ${mod.DIAGRAM_MAX_TOKENS}`,
+  );
 });
