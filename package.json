@@ -7,7 +7,7 @@
   "icon": "assets/icon.png",
   "license": "MIT",
   "scripts": {
-    "test": "node --test test/image-describe.test.cjs test/save-guard.test.cjs"
+    "test": "node --test test/*.test.cjs"
   },
   "repository": {
     "type": "git",
