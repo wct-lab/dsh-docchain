@@ -63,9 +63,13 @@ async function askUserForVisionModel(exec, { currentModel, models, askImpl }) {
     const picked = Array.isArray(answer?.answers)
       ? answer.answers.find((a) => a && a.id === 'vision-model')
       : undefined;
-    const selected =
-      (Array.isArray(picked?.selected) && picked.selected[0]) || picked?.custom || '';
-    return typeof selected === 'string' && selected.trim() ? selected.trim() : null;
+    const fromList = Array.isArray(picked?.selected) && picked.selected[0];
+    const custom = typeof picked?.custom === 'string' ? picked.custom.trim() : '';
+    if (typeof fromList === 'string' && fromList.trim()) {
+      return { model: fromList.trim(), fromList: true };
+    }
+    if (custom) return { model: custom, fromList: false };
+    return null;
   } catch {
     return null;
   }
@@ -139,22 +143,37 @@ test('排除网关误标成 is_vision=1 的 DocChain 知识库应用', () => {
 // 用户选择
 // ---------------------------------------------------------------------------
 
-test('用户点选后返回该模型', async () => {
+test('用户点选后返回该模型，并标记来自可信清单', async () => {
   const sq = { ask: async () => ({ answers: [{ id: 'vision-model', selected: ['doubao-seed-2.0-pro'] }] }) };
   const got = await askUserForVisionModel(
     { agent: { id: 's1', userQuestions: sq } },
     { currentModel: 's-deepseek-v4.1-flash', models: GATEWAY_VISION },
   );
-  assert.strictEqual(got, 'doubao-seed-2.0-pro');
+  assert.deepStrictEqual(got, { model: 'doubao-seed-2.0-pro', fromList: true });
 });
 
-test('用户自己输入的自由文本也能用', async () => {
+test('自由输入标记为不可信，调用方必须二次校验', async () => {
   const sq = { ask: async () => ({ answers: [{ id: 'vision-model', selected: [], custom: 'gpt-4o' }] }) };
   const got = await askUserForVisionModel(
     { agent: { id: 's1', userQuestions: sq } },
     { currentModel: 'x', models: GATEWAY_VISION },
   );
-  assert.strictEqual(got, 'gpt-4o');
+  assert.deepStrictEqual(got, { model: 'gpt-4o', fromList: false });
+});
+
+test('自由输入一个纯文本模型时，fromList=false 让调用方拦下它', async () => {
+  // 场景：对话模型是纯文本，弹窗出现，用户在输入框手打了另一个纯文本模型
+  const sq = { ask: async () => ({ answers: [{ id: 'vision-model', selected: [], custom: 'g-deepseek-v4-pro' }] }) };
+  const got = await askUserForVisionModel(
+    { agent: { id: 's1', userQuestions: sq } },
+    { currentModel: 's-deepseek-v4.1-flash', models: GATEWAY_VISION },
+  );
+  assert.strictEqual(got.fromList, false, '手打的名字必须走二次校验');
+  assert.strictEqual(got.model, 'g-deepseek-v4-pro');
+  // 调用方拿到 fromList=false 后会再查 is_vision，这个模型是 0，应当拒绝
+  const entry = GATEWAY_TEXT.find((m) => m.id === got.model);
+  assert.ok(entry, '该模型在网关清单里');
+  assert.strictEqual(entry.is_vision, 0, '确认它确实读不了图');
 });
 
 test('用户取消/未作答时返回 null（调用方据此报错，不擅自换模型）', async () => {
@@ -198,8 +217,30 @@ test('userQuestions 挂在 exec 上（而非 agent）时同样可用', async () 
     currentModel: 's-deepseek-v4.1-flash',
     models: GATEWAY_VISION,
   });
-  assert.strictEqual(got, 'qwen3-vl-plus');
+  assert.deepStrictEqual(got, { model: 'qwen3-vl-plus', fromList: true });
   assert.strictEqual(asked.length, 1, '只问一次');
+});
+
+// ---------------------------------------------------------------------------
+// 不读图的模式不该弹窗
+// ---------------------------------------------------------------------------
+
+test('read / list_models 不读图，不该因为对话模型是纯文本就打断用户', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'lib', 'tools', 'docchain.js'),
+    'utf8',
+  );
+  // read 只读旁路 md，list_models 只拉清单，两者都不调用视觉模型
+  assert.ok(
+    /const needsVision = !args\.read && !args\.list_models/.test(src),
+    '应按 read/list_models 跳过视觉校验',
+  );
+  assert.ok(
+    /if \(resolvedModel && needsVision\)/.test(src),
+    '校验应以 needsVision 为前提',
+  );
 });
 
 // ---------------------------------------------------------------------------
