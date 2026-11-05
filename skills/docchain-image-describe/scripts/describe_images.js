@@ -100,6 +100,18 @@ const DIAGRAM_MAX_LABEL_CHARS = 28;
  * 是工具自己删的。放宽到 40，覆盖真实组织架构的扇出规模。
  */
 const DIAGRAM_MAX_FANOUT = 40;
+/**
+ * 「平级兄弟被读成一条链」的检测阈值（判定逻辑见 detectSerializedSiblings）。
+ *
+ * 取值依据都是"别误报"：
+ *   - SERIAL_MIN_FANOUT = 5：2~4 个节点的链式写法（处理流水线）在流程图中很常见。
+ *   - SERIAL_CHAIN_RATIO = 0.8：一条真正的串链会覆盖几乎全部兄弟；组织图里
+ *     "研发一部↔研发二部"这种真协同通常只涉及两三个，占比很低。
+ *   - SERIAL_MIN_CHAIN_EDGES = 3：一两条互连按业务协同处理，不成规模不报。
+ */
+const SERIAL_MIN_FANOUT = 5;
+const SERIAL_CHAIN_RATIO = 0.8;
+const SERIAL_MIN_CHAIN_EDGES = 3;
 /** 纯符号（不含 +，加法节点是真实结构）。 */
 const NOISE_LABEL = /^[\s.,;:*\-–—=/\\×()（）%#_]+$/;
 
@@ -750,6 +762,8 @@ function parseGraph(text) {
     // 模型数错是常事，硬拦会把正常图挡回去。
     const declared = Number(data.boxCount);
     shrunk.declaredBoxCount = Number.isInteger(declared) && declared > 0 ? declared : null;
+    // 「平级兄弟被读成一条链」的自检：这种错的节点数是对的，只能靠结构指纹发现。
+    shrunk.serializedSiblings = detectSerializedSiblings(shrunk);
     return shrunk;
 }
 
@@ -785,6 +799,74 @@ function shrinkGraph(graph) {
         removedNodes: originalNodeCount - current.nodes.length,
         speculatedEdges: current.edges.filter((edge) => edge.speculated).length,
     };
+}
+
+/**
+ * 「一条记录一条线」：把**一组平级兄弟**读成了**一条链**。
+ *
+ * 典型踩坑（实测一张真实组织架构图）：图上是一个事业群下面挂 6 个办公室 + 20 条产品线，
+ * 全是平级、全都不带箭头（部门名竖排在色条里）。模型按"名字从上往下念"的顺序连，
+ * 得到 事业群 → 办公室1 → 办公室2 → … → 产品线1 → …，即**每条线一个下属**。
+ * 后果：6 个办公室变成一条链、20 条产品线全挂到了最后一个办公室下面 ——
+ * 图上"谁归谁管"这件事整体读反，而节点一个不少，所以任何计数类校验都发现不了。
+ *
+ * 判据来自这种错误的**结构指纹**，不依赖图的内容：
+ *   - 一个父节点扇出够大（≥ SERIAL_MIN_FANOUT），且它的子节点全都是叶子；
+ *   - 这些兄弟之间**彼此还连成一条链**（≥ SERIAL_MIN_CHAIN_EDGES 条）。
+ * 正常树状组织图里兄弟之间不会有上下级边；扇形分发的流程图里各分支叶子之间同样不互连。
+ * 两个条件同时成立，基本只能是"被串成链"。
+ *
+ * 注意：纯"一条大链"（父节点只有一个子节点、子节点再连下一个）**不在这里判**——
+ * 单链在哪张图里都可能是正常的流水线，只能靠证据（子节点的兄弟本该并列）判断，
+ * 而那种证据在图结构里没有。这条规则专抓"大扇出 + 兄弟被串起来"的混合形态，
+ * 因为扇出本身已经把"这些节点本来同级"这件事摆明了。
+ *
+ * 只做**告警**，不改图：把线删掉会让草图缺东西，而"缺"比"错"更难发现。
+ *
+ * @param {{nodes: Array, edges: Array}|null} graph
+ * @returns {{parentLabel: string, childCount: number, chainEdges: number, samples: string[]}|null}
+ */
+function detectSerializedSiblings(graph) {
+    if (!graph || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) return null;
+    const labelOf = new Map(graph.nodes.map((node) => [node.id, node.label]));
+    const out = new Map();
+    for (const edge of graph.edges) {
+        if (!labelOf.has(edge.from) || !labelOf.has(edge.to)) continue;
+        if (!out.has(edge.from)) out.set(edge.from, new Set());
+        out.get(edge.from).add(edge.to);
+    }
+    let best = null;
+    for (const [parent, children] of out) {
+        // 条件一：扇出够大。小扇出（2~4）串成链是常见且合理的写法，不能报。
+        if (children.size < SERIAL_MIN_FANOUT) continue;
+        const childSet = children;
+        // 条件二：兄弟之间互连，而且**绝大多数兄弟都卷进了这条链**。
+        // 这里不能要求"兄弟是叶子"：错误形态恰恰是 c1→c2→…→c8 这种每条出边
+        // 都指向兄弟的链，只有链尾那一个是叶子。要求"几乎不向外连"才是对的判据 ——
+        // 正常的扇出图里，每个分支各自往下走自己的路，不会把边打给兄弟。
+        const chain = graph.edges.filter(
+            (edge) => childSet.has(edge.from) && childSet.has(edge.to),
+        );
+        if (chain.length < SERIAL_MIN_CHAIN_EDGES) continue;
+        // 卷入链的兄弟占比：一条长链几乎覆盖全部兄弟；少量互连是正常业务协同。
+        const involved = new Set();
+        for (const edge of chain) {
+            involved.add(edge.from);
+            involved.add(edge.to);
+        }
+        if (involved.size / children.size < SERIAL_CHAIN_RATIO) continue;
+        if (!best || chain.length > best.chainEdges) {
+            best = {
+                parentLabel: labelOf.get(parent) || parent,
+                childCount: children.size,
+                chainEdges: chain.length,
+                samples: chain
+                    .slice(0, 3)
+                    .map((edge) => `${labelOf.get(edge.from)}→${labelOf.get(edge.to)}`),
+            };
+        }
+    }
+    return best;
 }
 
 /**
@@ -1648,6 +1730,16 @@ function buildPrompt(docNameText, index, total, diagramMode, declaredBoxCount) {
         '也要**分别列成两组节点**，用图上的行标题或下标区分（如 h_t 与 h′_t）；' +
         '行标题本身不算节点，但要用它把两排区分开，绝不能合并成一层。\n' +
         '   9. 每个出边单独一条，不要合并。\n' +
+        // 实测（真实组织架构图）：一个事业群下面挂 6 个办公室 + 20 条产品线，全是平级、
+        // 全不带箭头；模型按"名字从上往下念"的顺序连成一条链，结果 20 条产品线全挂到了
+        // 最后一个办公室下面。节点一个不少，所以数量类校验完全看不出来。
+        '   10. 一个大标题（或大方框）下面并排的一排、一列小方框，是**同时**属于它的下级，' +
+        '不是"第一个管第二个、第二个管第三个"。只要它们在图上处于同一层、' +
+        '没有箭头指向彼此，就要**分别**从大标题各连一条线过去；' +
+        '绝不能按版面顺序把它们串成一条链。\n' +
+        '   11. 竖排或横排的部门名 / 条目名挤在一起、彼此只有分隔线而**没有箭头**时，' +
+        '方向只可能是"上面管下面""左边管右边"：找出它们共同归属的那个上级，' +
+        '让上级分别连到每一个，不要按名字排列顺序连成串。\n' +
         'B. 其它图（海报/宣传图/分层色块的版式图、照片、界面截图、纯文字、曲线图、柱状图、表格等）：' +
         '按下面的规则写中文描述。\n' +
         // 复用同一段描述规则文本，保证"结构图关掉"与"其它图"两条路径逐字一致。
@@ -1972,6 +2064,13 @@ async function describeOneImage(ref, visionConfig, ctx, position) {
                             if (ctx.diagramLabelSamples.length < 5) ctx.diagramLabelSamples.push(item);
                         }
                     }
+                    // 平级兄弟被串成一条链：节点数对得上，只能靠结构指纹抓。
+                    if (fitted.serializedSiblings) {
+                        ctx.diagramSerialized += 1;
+                        if (ctx.diagramSerializedSamples.length < 3) {
+                            ctx.diagramSerializedSamples.push(fitted.serializedSiblings);
+                        }
+                    }
                     return { ok: true, kind: 'diagram', puml, ms: out.ms };
                 }
             }
@@ -2156,6 +2255,9 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
         // 模型自报方框数 > 实际列出数 的张数，以及补问后确实补回来的张数
         diagramUnderRead: 0,
         diagramUnderReadFixed: 0,
+        // 「平级兄弟被读成一条链」的张数，以及前几条样本（父节点 + 被串起来的边）
+        diagramSerialized: 0,
+        diagramSerializedSamples: [],
         rateLimited: 0,
         truncated: 0,
         compressed: 0,
@@ -2241,6 +2343,18 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
                 '；请对照原图确认是否漏了部门',
         );
     }
+    // 平级兄弟被串成一条链：节点数一个不少，所以靠数量根本发现不了，只能靠结构指纹。
+    if (ctx.diagramSerialized > 0) {
+        const samples = ctx.diagramSerializedSamples
+            .map((item) => `「${item.parentLabel}」下 ${item.childCount} 个平级节点之间有 ${item.chainEdges} 条互连（如 ${item.samples.join('、')}）`)
+            .join('；');
+        warnings.push(
+            `DIAGRAM_SERIALIZED：${ctx.diagramSerialized} 张图的草图疑似把**平级兄弟**读成了**一条链**` +
+                `（一张图里同一层的一组方框本应各自直连上级，草图却让它们首尾相连）。` +
+                `这类错误节点数是对的、线也是全的，看不出缺什么，只是"谁归谁管"整体读错。` +
+                `请对照原图确认层级关系。${samples ? `发现：${samples}` : ''}`,
+        );
+    }
     // 节点名被截断：可能是部门名被改名，必须把原名还回去。
     if (ctx.diagramLabelsTruncated > 0) {
         const samples = ctx.diagramLabelSamples
@@ -2297,6 +2411,8 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
             // 模型自报方框数比实际列出的多（它承认漏了）的张数，以及补问补回来的张数
             under_read: ctx.diagramUnderRead,
             under_read_fixed: ctx.diagramUnderReadFixed,
+            // 平级兄弟被读成一条链的张数：节点数对得上，只能靠结构指纹发现
+            serialized_siblings: ctx.diagramSerialized,
             // 复核：dual 是做了二次读图的张数，agreed 是交集可用的张数（其余退回主模型）。
             judge_model: ctx.judgeModel || null,
             dual: ctx.diagramDual,
@@ -2485,6 +2601,9 @@ module.exports = {
     fitGraph,
     shrinkGraph,
     mergeRedundantNodes,
+    detectSerializedSiblings,
+    SERIAL_MIN_FANOUT,
+    SERIAL_MIN_CHAIN_EDGES,
     truncateLabel,
     buildPrompt,
     buildKindPrompt,
