@@ -835,10 +835,22 @@ test('buildPrompt 结构图分支带通用约束（并列支路/方向/跨层/�
   }
 });
 
-test('buildPrompt 结构图分支给出 JSON 模板与节点上限', () => {
+test('buildPrompt 结构图分支给出 JSON 模板，且不再限制节点数量', () => {
   const on = mod.buildPrompt('d.pdf', 3, 185, 'on');
   assert.ok(on.includes('第 3/185 张'));
   assert.ok(on.includes('{"title"'));
-  assert.ok(on.includes('节点不超过 20 个'));
+  assert.ok(on.includes('boxCount'), '要求模型先数方框总数，供漏读检测用');
   assert.ok(on.includes('不要代码围栏'));
+  // 原来这里写着"节点不超过 20 个"，与代码侧 80 上限矛盾，会让模型主动漏读
+  assert.strictEqual(
+    on.includes('节点不超过 20 个'),
+    false,
+    '不能再限制模型写多少个节点',
+  );
+  assert.ok(on.includes('一个都不能省略'), '要明确要求不漏方框');
+});
+
+test('buildPrompt 补问时带上模型自报的方框数', () => {
+  const retry = mod.buildPrompt('d.pdf', 3, 185, 'on', 12);
+  assert.ok(retry.includes('12 个方框'), '补问要给出明确目标数量');
 });

@@ -91,8 +91,15 @@ const DEFAULT_DIAGRAM_MODE = 'on';
 const DIAGRAM_MAX_NODES = 80;
 const DIAGRAM_MAX_EDGES = 140;
 const DIAGRAM_MAX_LABEL_CHARS = 28;
-/** 一个节点最多画几条出边：只挡"放射状糊成一团"的极端情况。 */
-const DIAGRAM_MAX_FANOUT = 8;
+/**
+ * 一个节点最多画几条出边：只挡"放射状糊成一团"的极端情况。
+ *
+ * 原来是 8 —— 而组织架构图最典型的样子就是"一个中心挂二三十个平级部门"，
+ * 实测根节点挂 25 个单元时，第 9 条之后的边全被丢掉，对应节点随即变成孤立点
+ * 被一并删除：26 个节点进去只剩 9 个，一个警告都没有。这不是模型漏读，
+ * 是工具自己删的。放宽到 40，覆盖真实组织架构的扇出规模。
+ */
+const DIAGRAM_MAX_FANOUT = 40;
 /** 纯符号（不含 +，加法节点是真实结构）。 */
 const NOISE_LABEL = /^[\s.,;:*\-–—=/\\×()（）%#_]+$/;
 
@@ -738,6 +745,11 @@ function parseGraph(text) {
     // 只保留仍然留在图上的那些（被裁掉的节点不必再提它的名字被截过）
     const keptIds = new Set(shrunk.nodes.map((node) => node.label));
     shrunk.truncatedLabels = truncatedLabels.filter((item) => keptIds.has(item.shorter));
+    // 模型自报的方框总数（提示词要求它先数一遍再输出）。
+    // 与 nodes 数量对不上就是它自己承认漏了 —— 只当信号用，不做强校验：
+    // 模型数错是常事，硬拦会把正常图挡回去。
+    const declared = Number(data.boxCount);
+    shrunk.declaredBoxCount = Number.isInteger(declared) && declared > 0 ? declared : null;
     return shrunk;
 }
 
@@ -1590,19 +1602,29 @@ function parseKind(text) {
  * @param {string} [diagramMode] 'on' / 'off'
  * @returns {string}
  */
-function buildPrompt(docNameText, index, total, diagramMode) {
+function buildPrompt(docNameText, index, total, diagramMode, declaredBoxCount) {
     const prose = buildProsePrompt(docNameText, index, total);
     if (diagramMode === 'off') return prose;
-    const head = `这是文档《${docNameText}》中的一张图片（第 ${index}/${total} 张）。`;
+    let head = `这是文档《${docNameText}》中的一张图片（第 ${index}/${total} 张）。`;
+    // 补问时把上一轮模型自报的方框数带回来，给它一个明确的目标数量。
+    if (Number.isInteger(declaredBoxCount) && declaredBoxCount > 0) {
+        head += `这张图上有 ${declaredBoxCount} 个方框，请逐个列出，不要遗漏。`;
+    }
     return (
         head +
         '按下面二选一作答，只输出其中一种，不要解释、不要代码围栏、不要收尾提问。\n' +
         'A. 结构图（流程图、架构图、结构示意图、框图、时序图、状态图 —— 信息只能通过"谁连着谁、谁包含谁、' +
         '怎么分支、怎么汇合"表达，去掉方框和箭头信息就没了）：只输出一个 JSON 对象，别的什么都不要写：\n' +
-        '{"title":"图的标题，没有就空串","nodes":[{"id":"n1","label":"图中原文"}],' +
+        '{"title":"图的标题，没有就空串","boxCount":图上方框总数,"nodes":[{"id":"n1","label":"图中原文"}],' +
         '"edges":[{"from":"n1","to":"n2","label":"箭头上或线上的文字"}]}\n' +
         '   规则（按重要性，每条都对应实测踩过的坑）：\n' +
-        '   1. label 照抄图中原文，不改写、不翻译、不概括；看不清的节点直接不写，禁止编造；节点不超过 20 个。\n' +
+        // 这里原来写着"节点不超过 20 个"，而代码侧上限是 80 —— 图上 25 个部门时模型会主动
+        // 只写 20 个，等于工具自己让模型漏读。产物是给对话助手读的代码，少一个方框就等于
+        // 那个部门不存在，所以改成"有多少写多少"，并要求先数方框再输出。
+        '   1. label 照抄图中原文，不改写、不翻译、不概括；看不清的节点直接不写，禁止编造。\n' +
+        '   1b. 方框**一个都不能省略**：图上有多少个方框就写多少个节点，不要为了简洁而合并或跳过。' +
+        '输出 JSON 前先数一遍图里的方框总数，把它写进 boxCount 字段，并确认 nodes 的数量与它一致。' +
+        '例：{"title":"...","boxCount":12,"nodes":[...],"edges":[...]}\n' +
         // 实测：一张图里两条并列支路（图像支路/文本支路）会被它连成同一个输入，凭空多出跨支路的边。
         '   2. 并列的多条支路不要互连：图里 A 只连到 B，就不要写 A→C —— 即使 B、C 是同类模块、看起来"应该"都接 A。\n' +
         // 实测：图像 + 文字两个输入时，它只留文字那个节点，图像整路消失，于是文字"看起来"连了一圈。
@@ -1870,6 +1892,39 @@ async function describeOneImage(ref, visionConfig, ctx, position) {
                 if (ctx.diagramStructured > 0) ctx.diagramStructured -= 1;
             } else if (graph) {
                 let finalGraph = graph;
+                // 漏读补问：模型自己报了 boxCount，却比 nodes 少，说明它承认漏了方框。
+                // 只补问一次（成本可控），能补上就换成补问结果，补不上就用原来的。
+                if (
+                    Number.isInteger(graph.declaredBoxCount) &&
+                    graph.declaredBoxCount > graph.nodes.length
+                ) {
+                    const declared = graph.declaredBoxCount;
+                    ctx.diagramUnderRead += 1;
+                    try {
+                        const again = await vision.describeImage({
+                            baseUrl: visionConfig.url,
+                            apiKey: visionConfig.key,
+                            model: visionConfig.model,
+                            image: bytes,
+                            mime,
+                            prompt:
+                                buildPrompt(ctx.docName, position, ctx.total, ctx.diagramMode, declared) +
+                                `\n\n上一次只列出了 ${graph.nodes.length} 个方框，但图上有 ${declared} 个。` +
+                                '这次请把**每一个**方框都列出来，一个都不要漏，尤其注意成组出现的小字方框。',
+                            maxTokens: Math.max(DESC_MAX_TOKENS, DIAGRAM_MAX_TOKENS),
+                            state: ctx.state,
+                        });
+                        if (again.rateLimited) ctx.rateLimited += again.rateLimited;
+                        const redo = parseGraph(String(again.text || ''));
+                        // 只有确实变得更多才采用，避免补问反而更差
+                        if (redo && redo.nodes.length > graph.nodes.length) {
+                            finalGraph = redo;
+                            ctx.diagramUnderReadFixed += 1;
+                        }
+                    } catch {
+                        // 补问失败不拖垮这张图
+                    }
+                }
                 // 复核：同一个提示词换一个模型再读一遍，只保留两边都认可的连线。
                 // 复核失败（限流/超时/没给出可用数据）不拖垮这张图，退回主模型结果。
                 if (ctx.judgeModel && ctx.judgeModel !== visionConfig.model) {
@@ -2098,6 +2153,9 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
         // 节点名被截断的总数，以及前几条样本（原文 → 截断后）
         diagramLabelsTruncated: 0,
         diagramLabelSamples: [],
+        // 模型自报方框数 > 实际列出数 的张数，以及补问后确实补回来的张数
+        diagramUnderRead: 0,
+        diagramUnderReadFixed: 0,
         rateLimited: 0,
         truncated: 0,
         compressed: 0,
@@ -2174,6 +2232,15 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
             `DIAGRAM_MISSING：复核模型比主模型多认出 ${ctx.diagramMissingFromPrimary} 个节点，主模型的草图可能漏画，请对照原图确认`,
         );
     }
+    // 模型自报方框数多于实际列出数：它自己承认漏了方框。
+    if (ctx.diagramUnderRead > 0) {
+        const fixed = ctx.diagramUnderReadFixed;
+        warnings.push(
+            `DIAGRAM_UNDER_READ：${ctx.diagramUnderRead} 张图里模型自报的方框数多于它列出的节点数` +
+                (fixed > 0 ? `，补问后补回了 ${fixed} 张` : '，补问也没能补全') +
+                '；请对照原图确认是否漏了部门',
+        );
+    }
     // 节点名被截断：可能是部门名被改名，必须把原名还回去。
     if (ctx.diagramLabelsTruncated > 0) {
         const samples = ctx.diagramLabelSamples
@@ -2227,6 +2294,9 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
             missing_from_primary: ctx.diagramMissingFromPrimary,
             // 被截断的节点名数量（原名见 warnings 里的 DIAGRAM_LABEL_TRUNCATED）
             labels_truncated: ctx.diagramLabelsTruncated,
+            // 模型自报方框数比实际列出的多（它承认漏了）的张数，以及补问补回来的张数
+            under_read: ctx.diagramUnderRead,
+            under_read_fixed: ctx.diagramUnderReadFixed,
             // 复核：dual 是做了二次读图的张数，agreed 是交集可用的张数（其余退回主模型）。
             judge_model: ctx.judgeModel || null,
             dual: ctx.diagramDual,

@@ -406,3 +406,112 @@ test('token 上限要够画满允许的最大图（否则 JSON 被截断，草�
     `最坏情况下估算 ${estimated} token，仍应低于上限 ${mod.DIAGRAM_MAX_TOKENS}`,
   );
 });
+// ---------------------------------------------------------------------------
+// 漏读的三个工具侧原因（不是模型能力问题）
+//
+// 1. 提示词原来写着"节点不超过 20 个"，而代码上限 80 —— 图上有 25 个部门时
+//    模型会主动只写 20 个，等于工具自己让模型漏读。
+// 2. 扇出上限 8：根节点挂 25 个平级部门时，第 9 条之后的边被丢弃，对应节点
+//    变成孤立点被一并删除 —— 26 个节点进去只剩 9 个，一个警告都没有。
+// 3. 模型自报的方框数和实际列出的对不上时，之前没有任何检测。
+// ---------------------------------------------------------------------------
+
+test('扇出不再把平级部门吃掉：根挂 25 个单元照样全留', () => {
+  const nodes = [{ id: 'root', label: '云智能经营中心' }];
+  const edges = [];
+  for (let i = 1; i <= 25; i += 1) {
+    nodes.push({ id: `u${i}`, label: `单元${i}` });
+    edges.push({ from: 'root', to: `u${i}` });
+  }
+  const graph = mod.parseGraph(JSON.stringify({ nodes, edges }));
+  assert.ok(graph, '应该解析出图');
+  assert.strictEqual(graph.nodes.length, 26, '26 个方框一个都不能少');
+  assert.strictEqual(graph.edges.length, 25, '25 条边一条都不能少');
+  // 每个单元名都要出现在产物代码里，助手才读得到
+  const puml = mod.renderPuml(graph);
+  for (const node of nodes) {
+    assert.ok(puml.includes(node.label), `产物里缺了「${node.label}」`);
+  }
+});
+
+test('扇出上限已放宽到 40', () => {
+  const mod2 = mod;
+  // 直接验证行为：40 个平级子节点应全部保留
+  const nodes = [{ id: 'root', label: '根' }];
+  const edges = [];
+  for (let i = 1; i <= 40; i += 1) {
+    nodes.push({ id: `c${i}`, label: `子${i}` });
+    edges.push({ from: 'root', to: `c${i}` });
+  }
+  const graph = mod2.parseGraph(JSON.stringify({ nodes, edges }));
+  assert.ok(graph);
+  assert.strictEqual(graph.nodes.length, 41, '40 个子节点应全部保留');
+});
+
+test('模型自报的 boxCount 会被读出来，供漏读检测使用', () => {
+  const graph = mod.parseGraph(
+    JSON.stringify({
+      title: 't',
+      boxCount: 12,
+      nodes: [
+        { id: 'a', label: 'A' },
+        { id: 'b', label: 'B' },
+        { id: 'c', label: 'C' },
+        { id: 'd', label: 'D' },
+      ],
+      edges: [
+        { from: 'a', to: 'b' },
+        { from: 'a', to: 'c' },
+        { from: 'c', to: 'd' },
+      ],
+    }),
+  );
+  assert.ok(graph);
+  assert.strictEqual(graph.declaredBoxCount, 12, '应记下模型自报的方框数');
+  assert.ok(graph.declaredBoxCount > graph.nodes.length, '本例就是"自报多于实列"');
+});
+
+test('模型没给 boxCount 时该字段为 null，不会误判成漏读', () => {
+  const graph = mod.parseGraph(
+    JSON.stringify({
+      title: 't',
+      nodes: [
+        { id: 'a', label: 'A' },
+        { id: 'b', label: 'B' },
+        { id: 'c', label: 'C' },
+        { id: 'd', label: 'D' },
+      ],
+      edges: [
+        { from: 'a', to: 'b' },
+        { from: 'b', to: 'c' },
+        { from: 'c', to: 'd' },
+      ],
+    }),
+  );
+  assert.ok(graph);
+  assert.strictEqual(graph.declaredBoxCount, null);
+});
+
+test('boxCount 是乱填的（非正整数）也不当成漏读信号', () => {
+  for (const bad of [0, -3, 'abc', null, 1.5]) {
+    const graph = mod.parseGraph(
+      JSON.stringify({
+        title: 't',
+        boxCount: bad,
+        nodes: [
+          { id: 'a', label: 'A' },
+          { id: 'b', label: 'B' },
+          { id: 'c', label: 'C' },
+          { id: 'd', label: 'D' },
+        ],
+        edges: [
+          { from: 'a', to: 'b' },
+          { from: 'b', to: 'c' },
+          { from: 'c', to: 'd' },
+        ],
+      }),
+    );
+    assert.ok(graph);
+    assert.strictEqual(graph.declaredBoxCount, null, `boxCount=${JSON.stringify(bad)} 应被忽略`);
+  }
+});
