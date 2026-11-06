@@ -264,30 +264,55 @@ test('parseGraph 不再合并同名节点（N 层堆叠被压成一个模块就�
   );
 });
 
-test('parseGraph 丢掉纯数字/纯符号节点（patch 编号、刻度、单位），并限制扇出', () => {
+test('parseGraph 保留纯数字节点（64 可能是通道数/层宽，删了就是丢信息）', () => {
+  // 早先这里会把 1–2 位纯数字当编号删掉，理由是"图上编号不是模块"。
+  // 但 `64` 完全可能是通道数、层宽、类别数、层数 —— 光看字符串长度分不清。
+  // 删掉之后更糟的是前驱会被短路接到后继，凭空造出一条原图不存在的直连。
   const json = JSON.stringify({
     title: 'Transformer',
     nodes: [
       { id: 'p', label: 'Patch Embedding' },
+      { id: 'n64', label: '64' },
       { id: 'e', label: 'Encoder' },
       { id: 'o', label: 'Output' },
-      ...['0', '1', '2', '3', '*', '×N'].map((label) => ({ id: `n${label}`, label })),
     ],
     edges: [
-      ...['0', '1', '2', '3', '*', '×N'].map((label) => ({ from: 'p', to: `n${label}` })),
-      { from: 'p', to: 'e' },
+      { from: 'p', to: 'n64' },
+      { from: 'n64', to: 'e' },
       { from: 'e', to: 'o' },
     ],
   });
   const graph = mod.parseGraph(json);
   assert.deepStrictEqual(
     graph.nodes.map((node) => node.label),
-    ['Patch Embedding', 'Encoder', 'Output'],
+    ['Patch Embedding', '64', 'Encoder', 'Output'],
   );
-  // 噪声节点被丢后，边也只剩主干，不会再有那团放射状交叉线
+  // 关键：p→n64→e 必须保持两段，**不能**变成 p→e 的直连
   assert.deepStrictEqual(
     graph.edges.map((edge) => `${edge.from}>${edge.to}`),
-    ['p>e', 'e>o'],
+    ['p>n64', 'n64>e', 'e>o'],
+  );
+});
+
+test('parseGraph 只删纯符号节点（确定没有信息的那种）', () => {
+  const json = JSON.stringify({
+    title: '',
+    nodes: [
+      { id: 'a', label: 'A' },
+      { id: 'b', label: 'B' },
+      { id: 'c', label: 'C' },
+      { id: 's1', label: '---' },
+      { id: 's2', label: '·' },
+    ],
+    edges: [
+      { from: 'a', to: 'b' },
+      { from: 'b', to: 'c' },
+    ],
+  });
+  const graph = mod.parseGraph(json);
+  assert.deepStrictEqual(
+    graph.nodes.map((node) => node.label),
+    ['A', 'B', 'C'],
   );
 });
 
@@ -310,29 +335,41 @@ test('parseGraph 把超长标签截到上限，避免把图撑爆', () => {
   assert.ok(label.endsWith('…'));
 });
 
-test('parseGraph 丢掉噪声节点时会把它前驱接到后继（主干不能断）', () => {
+test('parseGraph 不再短路造边：原图没有的直连，一条都不能补出来', () => {
+  // 早先的实现会把"被丢掉的节点"的前驱直接接到后继上，以免主干断开。
+  // 代价是凭空造出一条原图不存在的关系，而且下游助手分不清它是推断的。
+  // 现在的口径：端点不存在的边直接丢掉，绝不拼接。
   const json = JSON.stringify({
     title: '',
     nodes: [
       { id: 'p', label: 'Patch Embedding' },
-      { id: 'x', label: '1' },
       { id: 'e', label: 'Encoder' },
       { id: 'o', label: 'Output' },
     ],
     edges: [
+      // x 不在节点表里 —— 这条边悬空
       { from: 'p', to: 'x' },
       { from: 'x', to: 'e' },
       { from: 'e', to: 'o' },
+      { from: 'p', to: 'o' }, // 唯一真实存在的第二条件，保证图不被判太小
     ],
   });
   const graph = mod.parseGraph(json);
-  assert.deepStrictEqual(
-    graph.edges.map((edge) => `${edge.from}>${edge.to}`),
-    ['p>e', 'e>o'],
-  );
+  const pairs = graph.edges.map((edge) => `${edge.from}>${edge.to}`);
+  assert.deepStrictEqual(pairs, ['e>o', 'p>o']);
+  // 悬空边被丢之后，绝不能出现 p>e 这种"接出来"的边
+  assert.ok(!pairs.includes('p>e'), '不得把 p→x→e 短路成 p→e');
 });
 
-test('parseGraph 丢掉一条边都不沾的"漂浮标签"（原图的行标题被当成节点）', () => {
+test('parseGraph 保留一条边都不沾的节点，并报成孤立点（不能静默删掉真实部门）', () => {
+  // 早先这里是一刀切"直接丢"：没连线的节点被当成漂浮的版面标注删掉。
+  // 但实测一个真实组织架构图，「综合业务产品线」这个最顶上的标题框模型没认出来，
+  // 它下面 7 个单位全都失去了上级，其中「综合规划部」「西安研发中心」
+  // 「南京第二研发中心」本身没有下属，成了孤立点 —— 被这个过滤删得干干净净，
+  // 既没有计数也没有警告。少了一个部门，产物里就永远不知道它存在。
+  //
+  // 现在改成：**保留**，并挂到 orphanNodes 上让上层告警。
+  // 判断"是不是版面标注"交给 annotationHeavy 那套，不靠"没连线"一刀切。
   const json = JSON.stringify({
     title: '',
     nodes: [
@@ -340,7 +377,7 @@ test('parseGraph 丢掉一条边都不沾的"漂浮标签"（原图的行标题�
       { id: 'x', label: 'X_t' },
       { id: 'h', label: 'h_t' },
       { id: 'l1', label: '输入层' },
-      { id: 'l2', label: '输出层' },
+      { id: 'l2', label: '综合规划部' },
     ],
     edges: [
       { from: 'e', to: 'x' },
@@ -350,16 +387,45 @@ test('parseGraph 丢掉一条边都不沾的"漂浮标签"（原图的行标题�
   const graph = mod.parseGraph(json);
   assert.deepStrictEqual(
     graph.nodes.map((node) => node.label),
-    ['Embedding', 'X_t', 'h_t'],
+    ['Embedding', 'X_t', 'h_t', '输入层', '综合规划部'],
   );
+  assert.deepStrictEqual(graph.orphanNodes, ['输入层', '综合规划部']);
 });
 
-test('parseGraph 把 LaTeX 下标 X_{t-1} 洗成 X_t-1（花括号原样画出来很难看）', () => {
+test('纯符号在建节点阶段就被筛掉，数字则保留', () => {
+  // isNoiseLabel 现在只挡"确定没有信息"的：空串与纯符号。
+  // 数字（`1`）保留 —— 它可能真是编号，也可能是层宽/通道数，无从分辨时保留更安全。
   const json = JSON.stringify({
     title: '',
     nodes: [
-      { id: 'a', label: 'X_{t-1}' },
-      { id: 'b', label: 'h_{t}' },
+      { id: 'a', label: 'A' },
+      { id: 'b', label: 'B' },
+      { id: 'c', label: 'C' },
+      { id: 'n1', label: '1' },
+      { id: 'n2', label: '---' },
+    ],
+    edges: [
+      { from: 'a', to: 'b' },
+      { from: 'b', to: 'c' },
+    ],
+  });
+  const graph = mod.parseGraph(json);
+  assert.deepStrictEqual(
+    graph.nodes.map((node) => node.label),
+    ['A', 'B', 'C', '1'],
+  );
+  // `1` 没有边 → 报成孤立点，不静默丢弃
+  assert.deepStrictEqual(graph.orphanNodes, ['1']);
+});
+
+test('parseGraph 原样保留公式的大括号（洗掉会改变数学含义）', () => {
+  // `x^{a+b}` 是 a+b 次方，洗成 `x^a+b` 就成了 a 次方再加 b —— 完全是另一个式子。
+  // PlantUML 引号字符串里 `{}` 是普通字符，实测能正常渲染，没有清洗的必要。
+  const json = JSON.stringify({
+    title: '',
+    nodes: [
+      { id: 'a', label: 'x^{a+b}' },
+      { id: 'b', label: 'h_{t-1}' },
       { id: 'c', label: 'y_t' },
     ],
     edges: [
@@ -369,7 +435,7 @@ test('parseGraph 把 LaTeX 下标 X_{t-1} 洗成 X_t-1（花括号原样画出�
   });
   assert.deepStrictEqual(
     mod.parseGraph(json).nodes.map((node) => node.label),
-    ['X_t-1', 'h_t', 'y_t'],
+    ['x^{a+b}', 'h_{t-1}', 'y_t'],
   );
 });
 
@@ -405,11 +471,100 @@ test('subtractContradictions 只删"方向相反"的边，其余保留（不把�
     merged.edges.map((e) => `${e.from}>${e.to}`),
     ['b>c', 'c>d'],
   );
-  // 变孤立的节点要一并去掉（a 的边被删了）
+  // **节点一个都不能少**：a 的边被删了，但"图像"这个框确实存在，
+  // 关系有争议 ≠ 节点不存在。少画一个节点，下游助手就永远看不到它。
   assert.deepStrictEqual(
     merged.nodes.map((n) => n.id),
-    ['b', 'c', 'd'],
+    ['a', 'b', 'c', 'd'],
   );
+});
+
+test('subtractContradictions 保留分组与元数据，不静默丢弃', () => {
+  // 早先只返回 {title, nodes, edges}，groups 等字段凭空蒸发。
+  const primary = {
+    title: '组织结构',
+    nodes: [
+      { id: 'a', label: 'Root' },
+      { id: 'b', label: 'A' },
+      { id: 'c', label: 'B' },
+      { id: 'd', label: '孤儿部门' },
+    ],
+    edges: [
+      { from: 'a', to: 'b', label: '' },
+      { from: 'a', to: 'c', label: '' },
+      { from: 'b', to: 'c', label: '' },
+    ],
+    groups: [{ label: '平级组', members: ['b', 'c'] }],
+    truncatedLabels: [],
+    declaredBoxCount: 4,
+  };
+  const judge = {
+    title: '组织结构',
+    nodes: [
+      { id: 'x', label: 'Root' },
+      { id: 'y', label: 'A' },
+      { id: 'z', label: 'B' },
+      { id: 'w', label: '孤儿部门' },
+    ],
+    edges: [
+      { from: 'x', to: 'y', label: '' },
+      { from: 'x', to: 'z', label: '' },
+      { from: 'z', to: 'y', label: '' }, // 与 b→c 相反
+    ],
+  };
+  const merged = mod.subtractContradictions(primary, judge);
+  assert.ok(merged);
+  // groups 要保留，并按最终节点重新校验
+  assert.deepStrictEqual(merged.groups, [{ label: '平级组', members: ['b', 'c'] }]);
+  // 其它元数据也要带过来
+  assert.strictEqual(merged.title, '组织结构');
+  assert.strictEqual(merged.declaredBoxCount, 4);
+  // 孤立节点保留
+  assert.ok(merged.nodes.some((n) => n.id === 'd'));
+  // 删掉的边要计数
+  assert.strictEqual(merged.conflicts.reversed, 1);
+});
+
+test('subtractContradictions 能发现"挂错上级"（方向不冲突，只查反向边发现不了）', () => {
+  // 组织架构里最常见的错：主模型说 B 归 A，复核说 B 直接归 Root。
+  // 两条边方向并不冲突（A→B 和 Root→B），旧逻辑完全看不见，会静默留下错的那个。
+  const primary = {
+    title: '',
+    nodes: [
+      { id: 'r', label: 'Root' },
+      { id: 'a', label: 'A' },
+      { id: 'b', label: 'B' },
+      { id: 'x', label: 'X' },
+    ],
+    edges: [
+      { from: 'r', to: 'a', label: '' },
+      { from: 'r', to: 'x', label: '' },
+      { from: 'a', to: 'b', label: '' },
+    ],
+  };
+  const judge = {
+    title: '',
+    nodes: [
+      { id: 'p', label: 'Root' },
+      { id: 'q', label: 'A' },
+      { id: 's', label: 'B' },
+      { id: 't', label: 'X' },
+    ],
+    edges: [
+      { from: 'p', to: 'q', label: '' },
+      { from: 'p', to: 't', label: '' },
+      { from: 'p', to: 's', label: '' }, // B 直接归 Root
+    ],
+  };
+  const merged = mod.subtractContradictions(primary, judge);
+  assert.ok(merged);
+  const conflicts = merged.conflicts.wrong_parent;
+  assert.strictEqual(conflicts.length, 1);
+  assert.strictEqual(conflicts[0].child, 'B');
+  assert.strictEqual(conflicts[0].primary_parent, 'A');
+  assert.deepStrictEqual(conflicts[0].judge_parents, ['Root']);
+  // 只告警不改图：边仍然保留主模型的版本，由人判断
+  assert.ok(merged.edges.some((e) => e.from === 'a' && e.to === 'b'));
 });
 
 test('subtractContradictions 删除后剩太少就返回 null（调用方退回主模型）', () => {
@@ -461,11 +616,13 @@ test('fitGraph 把过长的草图裁到上限内，且只删叶子节点（不�
   }
 });
 
-test('短路只走"唯一后继"：扇形枢纽被丢弃时不能把兄弟节点连成网状', () => {
+test('数字节点不再被丢弃，也不会把兄弟连成网状', () => {
+  // 早先 `3` 会被当序号丢掉，然后它的前驱/后继被短路拼接，兄弟节点两两连线。
+  // 现在 `3` 是节点（它可能真是编号，也可能是参数），边全部照原样保留。
   const json = JSON.stringify({
     title: '',
     nodes: [
-      { id: 'hub', label: '3' }, // 1–2 位序号 → 被当噪声丢弃
+      { id: 'hub', label: '3' },
       { id: 'a', label: 'A 公司' },
       { id: 'b', label: 'B 公司' },
       { id: 'c', label: 'C 公司' },
@@ -484,49 +641,95 @@ test('短路只走"唯一后继"：扇形枢纽被丢弃时不能把兄弟节点
     ],
   });
   const graph = mod.parseGraph(json);
-  // hub 被丢 → 它的边全部作废，只保留两条真实边，不能出现 a→c 这类兄弟互连
+  // `3` 保留；所有边都在，不产生任何原本不存在的兄弟互连
+  assert.ok(graph.nodes.some((n) => n.label === '3'), '数字节点必须保留');
+  assert.strictEqual(graph.edges.length, 9);
+  assert.ok(!graph.edges.some((e) => e.from === 'a' && e.to === 'c'), '不得凭空造出 a→c');
+});
+
+test('mergeRedundantNodes 不再合并任何节点（同名同邻居也可能是两个独立实体）', () => {
+  // 早先的规则：标签相同 + 邻居签名相同 → 认为是同一个框。
+  // 实测反例：Input 同时连两个独立的 Worker，两个 Worker 又各连 Output
+  // —— 标签相同、邻居也完全相同，但它们是两个并行分支，合并就少了一条支路。
+  const result = mod.mergeRedundantNodes(
+    [
+      { id: 'in', label: 'Input' },
+      { id: 'w1', label: 'Worker' },
+      { id: 'w2', label: 'Worker' },
+      { id: 'out', label: 'Output' },
+    ],
+    [
+      { from: 'in', to: 'w1', label: '' },
+      { from: 'in', to: 'w2', label: '' },
+      { from: 'w1', to: 'out', label: '' },
+      { from: 'w2', to: 'out', label: '' },
+    ],
+  );
+  assert.strictEqual(result.merged, 0, '同名同邻居也不得合并');
+  assert.strictEqual(result.nodes.length, 4);
+  assert.strictEqual(result.edges.length, 4);
+});
+
+test('parseGraph 保留两个同名同邻居的独立节点（并行分支不能少一条）', () => {
+  const json = JSON.stringify({
+    title: '',
+    nodes: [
+      { id: 'in', label: 'Input' },
+      { id: 'w1', label: 'Worker' },
+      { id: 'w2', label: 'Worker' },
+      { id: 'out', label: 'Output' },
+    ],
+    edges: [
+      { from: 'in', to: 'w1' },
+      { from: 'in', to: 'w2' },
+      { from: 'w1', to: 'out' },
+      { from: 'w2', to: 'out' },
+    ],
+  });
+  const graph = mod.parseGraph(json);
+  assert.strictEqual(graph.nodes.length, 4, '两个 Worker 都要留着');
+  assert.strictEqual(graph.edges.length, 4);
+});
+
+test('同一对节点之间不同标签的连线都要保留', () => {
+  // `Client→Service[Request]` 与 `Client→Service[Retry]` 是两条独立的交互，
+  // 只按 from>to 去重会把 Retry 那条吃掉。
+  const json = JSON.stringify({
+    title: '',
+    nodes: [
+      { id: 'c', label: 'Client' },
+      { id: 's', label: 'Service' },
+      { id: 'z', label: 'Z' },
+    ],
+    edges: [
+      { from: 'c', to: 's', label: 'Request' },
+      { from: 'c', to: 's', label: 'Retry' },
+      { from: 's', to: 'z', label: '' },
+    ],
+  });
+  const graph = mod.parseGraph(json);
+  assert.strictEqual(graph.edges.length, 3);
   assert.deepStrictEqual(
-    graph.edges.map((edge) => `${edge.from}>${edge.to}`),
-    ['a>b', 'c>d'],
+    graph.edges.filter((e) => e.from === 'c').map((e) => e.label).sort(),
+    ['Request', 'Retry'],
   );
 });
 
-test('mergeRedundantNodes 合并"同名且邻居完全一致"的重复节点，但不压扁同名长链', () => {
-  // 场景一：同名长链（VGG19 那种 512→512→512），邻居不同 → 一个都不能合
-  const chain = mod.mergeRedundantNodes(
-    [
-      { id: 'a', label: '512' },
-      { id: 'b', label: '512' },
-      { id: 'c', label: '512' },
+test('完全相同的连线（同端点同标签）仍然去重', () => {
+  const json = JSON.stringify({
+    title: '',
+    nodes: [
+      { id: 'a', label: 'A' },
+      { id: 'b', label: 'B' },
+      { id: 'c', label: 'C' },
     ],
-    [
-      { from: 'a', to: 'b', label: '' },
+    edges: [
+      { from: 'a', to: 'b', label: 'go' },
+      { from: 'a', to: 'b', label: 'go' },
       { from: 'b', to: 'c', label: '' },
     ],
-  );
-  assert.strictEqual(chain.merged, 0, '同名长链不能被合并');
-  assert.strictEqual(chain.nodes.length, 3);
-
-  // 场景二：同一个框被写成两个 id，邻居完全一致 → 合并，且丢掉自环
-  const dup = mod.mergeRedundantNodes(
-    [
-      { id: 'x', label: 'h_t' },
-      { id: 'y', label: 'h_t' },
-      { id: 'in', label: 'x_t' },
-      { id: 'out', label: 'y_t' },
-    ],
-    [
-      { from: 'in', to: 'x', label: '' },
-      { from: 'in', to: 'y', label: '' },
-      { from: 'x', to: 'out', label: '' },
-      { from: 'y', to: 'out', label: '' },
-    ],
-  );
-  assert.strictEqual(dup.merged, 1);
-  assert.deepStrictEqual(
-    dup.edges.map((edge) => `${edge.from}>${edge.to}`),
-    ['in>x', 'x>out'],
-  );
+  });
+  assert.strictEqual(mod.parseGraph(json).edges.length, 2);
 });
 
 test('buildKindPrompt 把"必须有连接线"作为结构图的硬门槛', () => {

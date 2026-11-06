@@ -20,15 +20,20 @@ const assert = require('node:assert');
 const mod = require('../skills/docchain-image-describe/scripts/describe_images.js');
 
 // ---------------------------------------------------------------------------
-// 缺陷 1：短路造边
+// 缺陷 1（已废弃）：短路造边
+//
+// 早先的做法：把被丢掉节点的前驱直接接到它的后继上，救主干，并标 speculated。
+// 现在**彻底不造边**了 —— 见下方两段说明。
 // ---------------------------------------------------------------------------
 
-test('短路产生的边必须标记为 speculated，不能冒充原图的确定关系', () => {
+test('数字编号节点不再被丢弃，因此也不会触发任何拼接', () => {
+  // 早先 `1` 会被当纯数字噪声丢掉，然后 a→1→b 被短路成 a→b（标 speculated）。
+  // 现在 `1` 是节点：它可能真是编号，也可能是层宽/参数，无从分辨时保留更安全。
   const graph = mod.parseGraph(
     JSON.stringify({
       nodes: [
         { id: 'a', label: '营销管理办公室' },
-        { id: 'n1', label: '1' }, // 纯数字编号，会被当成噪声丢掉
+        { id: 'n1', label: '1' },
         { id: 'b', label: '用户体验设计部' },
         { id: 'c', label: '产品规划部' },
         { id: 'd', label: '市场运营部' },
@@ -45,46 +50,49 @@ test('短路产生的边必须标记为 speculated，不能冒充原图的确定
   );
   assert.ok(graph, '应该能解析出图');
 
-  // 编号节点被丢掉了（这是既有行为，不改）
+  // 编号节点保留
   assert.strictEqual(
     graph.nodes.some((n) => n.label === '1'),
-    false,
-    '编号节点仍应被丢弃',
+    true,
+    '编号节点现在必须保留',
   );
 
-  // 关键：a→b 这条边是短路造出来的，必须带 speculated 标记
-  const shorted = graph.edges.find((e) => e.from === 'a' && e.to === 'b');
-  assert.ok(shorted, '短路仍然要保住主干（a→b 存在）');
-  assert.strictEqual(shorted.speculated, true, '短路造出来的边必须标记 speculated');
-
-  // 原图本来就有的边不能带 speculated
-  const real = graph.edges.find((e) => e.from === 'b' && e.to === 'c');
-  assert.ok(real, '原图的边要保留');
-  assert.notStrictEqual(real.speculated, true, '原图已有的边不该被标记成推测');
+  // 关键：a→b 这条"跳过了中间节点"的边**根本不该出现**
+  assert.strictEqual(
+    graph.edges.some((e) => e.from === 'a' && e.to === 'b'),
+    false,
+    '绝不能把 a→n1→b 拼成 a→b',
+  );
+  // 真实的 a→n1、n1→b 两段都在
+  assert.ok(graph.edges.some((e) => e.from === 'a' && e.to === 'n1'));
+  assert.ok(graph.edges.some((e) => e.from === 'n1' && e.to === 'b'));
 });
 
-test('猜测边会被统计出来，方便人工核对', () => {
+test('悬空边直接丢弃，绝不拼接成推断边', () => {
   const graph = mod.parseGraph(
     JSON.stringify({
       nodes: [
-        { id: 'a', label: '营销管理办公室' },
-        { id: 'n1', label: '2' },
-        { id: 'b', label: '用户体验设计部' },
-        { id: 'c', label: '产品规划部' },
-        { id: 'd', label: '市场运营部' },
-        { id: 'e', label: '技术研发部' },
+        { id: 'a', label: 'A' },
+        { id: 'b', label: 'B' },
+        { id: 'c', label: 'C' },
+        { id: 'd', label: 'D' },
       ],
       edges: [
-        { from: 'a', to: 'n1' },
-        { from: 'n1', to: 'b' },
+        { from: 'a', to: 'ghost' }, // ghost 不在节点表
+        { from: 'ghost', to: 'b' },
         { from: 'b', to: 'c' },
         { from: 'c', to: 'd' },
-        { from: 'd', to: 'e' },
+        { from: 'a', to: 'd' },
       ],
     }),
   );
   assert.ok(graph);
-  assert.strictEqual(graph.speculatedEdges, 1, '应统计出 1 条推测边');
+  assert.strictEqual(graph.speculatedEdges, 0, '不再产生任何推断边');
+  assert.strictEqual(
+    graph.edges.some((e) => e.from === 'a' && e.to === 'b'),
+    false,
+    '不得把 a→ghost→b 拼成 a→b',
+  );
 });
 
 test('渲染时猜测边用虚线，和确定关系区分开', () => {

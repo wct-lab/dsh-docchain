@@ -101,33 +101,62 @@ const DIAGRAM_MAX_LABEL_CHARS = 28;
  */
 const DIAGRAM_MAX_FANOUT = 40;
 /**
+ * 平级分组：把"一批同属同一上级、彼此没有隶属关系"的方框显式圈出来。
+ *
+ * 为什么需要它：组织架构图最常见的错法不是漏节点，而是**把并列关系读成层级关系**。
+ * 模型看到"事业群下面一排 20 条产品线"，会按版面从上到下念成
+ * 产品线1 → 产品线2 → …，或者把它们挂到第一个办公室下面。节点数一个不少，
+ * 所以任何计数校验都发现不了，但"谁归谁管"已经全错了。
+ *
+ * 让模型在出 JSON 时**先把平级的一组框圈出来**，等于逼它自己回答
+ * "这些是兄弟还是上下级"。圈成一组之后：① 渲染时包进 package{}，视觉上一目了然；
+ * ② 组内互连可以直接判为可疑（兄弟之间不该有隶属线）。
+ */
+const DIAGRAM_GROUP_MIN_MEMBERS = 2;
+/**
  * 「平级兄弟被读成一条链」的检测阈值（判定逻辑见 detectSerializedSiblings）。
  *
  * 取值依据都是"别误报"：
- *   - SERIAL_MIN_FANOUT = 5：2~4 个节点的链式写法（处理流水线）在流程图中很常见。
+ *   - SERIAL_MIN_FANOUT = 3：原来写 5，但实测一张真实组织图里模型只把 4 个
+ *     产品线挂到了「经营管理办公室」下面（本来是 20 个全部直连事业群），
+ *     5 这个门槛刚好从底下漏过去，检测器一声不响。3 是最小的"成组"规模 ——
+ *     2 个节点的前后关系在流程图中太常见，不能报。
  *   - SERIAL_CHAIN_RATIO = 0.8：一条真正的串链会覆盖几乎全部兄弟；组织图里
  *     "研发一部↔研发二部"这种真协同通常只涉及两三个，占比很低。
  *   - SERIAL_MIN_CHAIN_EDGES = 3：一两条互连按业务协同处理，不成规模不报。
  */
-const SERIAL_MIN_FANOUT = 5;
+const SERIAL_MIN_FANOUT = 3;
 const SERIAL_CHAIN_RATIO = 0.8;
 const SERIAL_MIN_CHAIN_EDGES = 3;
-/** 纯符号（不含 +，加法节点是真实结构）。 */
-const NOISE_LABEL = /^[\s.,;:*\-–—=/\\×()（）%#_]+$/;
+/**
+ * 纯符号（不含 `+`，加法节点是真实结构；也不含数字，见 isNoiseLabel 的说明）。
+ * `·` 是分层间隔号，单独成节点时没有任何信息。
+ */
+const NOISE_LABEL = /^[\s.,;:*\-–—=/\\×·()（）%#_]+$/;
 
 /**
- * 是否"不是模块"的标签。
+ * 是否"明显不是模块名"的标签。
  *
- * 只挡确定是编号/标注的东西：1–2 位序号（0…9）、纯符号、以及 L×、Nv×、×N 这类
- * "重复多少次"的重复次数标注。**不再**一刀切掉所有纯数字 —— `4096`、`224` 是真实的
- * 层宽/尺寸，丢掉就少了一层结构。
+ * **只剩两条，而且都只凭"字符串里根本没有信息"判定**：
+ *   - 空串；
+ *   - 纯符号（`—`、`---`、`·`、`/` 这类）。
+ *
+ * 曾经还删过「1–2 位纯数字」和「L×/N×/×N」。两条都被实测否掉了：
+ *
+ *   - **纯数字**：`64` 可能是通道数、层宽、类别数、层数，也可能真是编号，
+ *     光看字符串长度分不清。删掉之后更糟的是 —— 前驱会被短路接到后继上，
+ *     凭空造出一条原图不存在的直连（实测 `Input → 64 → Output` 变成
+ *     `Input → Output`，还标成"推断边"）。**多一个框只是不好看，多一条假关系
+ *     会让下游助手把"先后经过"当成"直接依赖"。**
+ *   - **×N 重复次数**：`4×` 确实是"这层重复 4 次"，属于真实参数信息，
+ *     删了就是丢数据；留着画成框虽然不完美，但信息没丢。
+ *
+ * 取舍依据（与工具整体口径一致）：**事实准确性 > 信息完整性 > 不确定性表达 > 简洁**。
+ * 所以这里只删"确定没有信息"的东西，其余一律保留。
  */
 function isNoiseLabel(text) {
     const value = String(text == null ? '' : text).trim();
     if (!value) return true;
-    if (/^\d{1,2}$/.test(value)) return true;
-    if (/^[A-Za-z]{0,3}\s*[×xX]$/.test(value)) return true;
-    if (/^[×xX]\s*[Nn]$/.test(value)) return true;
     return NOISE_LABEL.test(value);
 }
 /** 低于这个规模不认作结构图：单链条、散点、纯文字截图都会被这条筛回描述路径。 */
@@ -190,24 +219,34 @@ vision_api_key: 视觉模型网关的 Key（工具路径从凭据库 IWHALE_API_
 方式4: 包内 skills/docchain_config.json（分发兜底）`;
 
 const DEFAULT_VISION_URL = 'https://lab.iwhalecloud.com/gpt-proxy/v1';
-const DEFAULT_VISION_MODEL = 'qwen3-vl-plus';
+// 与候选清单第一位保持一致：单跑脚本（不经宿主）时用的就是横评第一名。
+const DEFAULT_VISION_MODEL = 'doubao-seed-2.0-pro';
 const DEFAULT_VISION_FALLBACK = 'g-deepseek-v4-flash';
 /**
  * 视觉模型候选，按综合能力从高到低。第一个可用的当主模型兜底，
  * 复核模型取其中第一个「可用且与主模型不同」的。
  *
- * 前三个是针对视觉任务训练的 VL 模型，且在真实文档上量过效果：
- * qwen3-vl-plus 会把并列输入读成合并、doubao-seed-2.0-pro 会把连线方向读反，
- * 两者取交集能压掉编造的边。后两个是金牌渠道的通用模型，只为覆盖面补位。
+ * 顺序来自一次真实横评（5 个模型 × 6 张真实组织架构图 × 每张 2 次，
+ * 判分标准是"根的下级数量对不对"，见 docchain-image-describe 的评测记录）：
+ *
+ *   doubao-seed-2.0-pro      100   6/6 张全对
+ *   g-doubao-seed-2.1-pro    100   6/6 张全对
+ *   qwen3-vl-plus           69.9   **两排平级的组织图 0 分**（根下级只认出 6/31），
+ *                                  其余单层扇出的图全对
+ *   glm-5v-turbo            60.5   能读对的图读得很准，但会把"简单扇出"误判成普通描述，
+ *                                  整张图不出草图；还容易 429
+ *   g-gpt-5.6-sol            未测   按用户要求置底
+ *
+ * 一句话：单层扇出的树，前四个都行；**两排平级的组织架构图只有 doubao 两个稳**。
  *
  * 与 index.js 的 DEFAULT_VISION_CANDIDATES 保持一致；实际以配置
  * docchain_vision_candidates 为准，这里只是没人配置时的兜底。
  */
 const DEFAULT_VISION_CANDIDATES = [
-    'qwen3-vl-plus',
     'doubao-seed-2.0-pro',
-    'glm-5v-turbo',
     'g-doubao-seed-2.1-pro',
+    'qwen3-vl-plus',
+    'glm-5v-turbo',
     'g-gpt-5.6-sol',
 ];
 
@@ -634,10 +673,15 @@ function parseGraph(text) {
         const id = String(item.id == null ? '' : item.id).trim();
         const rawLabel = String(item.label == null ? '' : item.label)
             .replace(/\s+/g, ' ')
-            // 模型会把 LaTeX 下标照抄成 X_{t-1}，PlantUML 不解释它，原样画出来很丑；
-            // 去掉花括号变成 X_t-1，短且不丢信息。
-            .replace(/_\{([^{}]*)\}/g, '_$1')
-            .replace(/\^\{([^{}]*)\}/g, '^$1')
+            // **不再剥掉公式的大括号。**
+            //
+            // 早先这里会把 `x^{a+b}` 洗成 `x^a+b`，理由只是"画出来好看一点"。
+            // 但这不是美化，是**改数学含义**：`x^{a+b}` 是 a+b 次方，`x^a+b` 是
+            // a 次方再加 b。下游助手拿到的如果是一串错公式，比没有公式更糟。
+            //
+            // PlantUML 的引号字符串里 `{}` 是普通字符，原样保留不会让渲染失败；
+            // 即便某个渲染器显示得难看，那也是展示问题，不能写成事实问题。
+            // 需要"好看"时，由展示层（renderPuml 的转义）单独处理，不动原始标签。
             .trim();
         if (!id || !rawLabel || seen.has(id)) continue;
         seen.add(id);
@@ -666,62 +710,38 @@ function parseGraph(text) {
         const label = String(item.label == null ? '' : item.label).replace(/\s+/g, ' ').trim();
         rawEdges.push({ from, to, label });
     }
-    // 被丢掉的节点（patch 编号那类）要"短路"掉：把它的前驱直接接到它的后继上，
-    // 否则 "Patch Embedding → 0…9 → Encoder" 这种主干会被拆成两截、图就断开了。
+    // **不再短路造边。**
     //
-    // 但短路造出来的是一段**推断**，原图里并没有这条边：
-    //   营销管理办公室 → [1] → 用户体验设计部   短路后变成
-    //   营销管理办公室 → 用户体验设计部
-    // 对组织架构图这种"图上编号被当噪声丢掉"的情形，等于凭空画出一条汇报线。
-    // 缺节点看得出来，多一条线看不出来，所以短路边一律打 speculated 标记，
-    // 渲染时画成虚线，并计入 speculatedEdges。
-    const rawOut = new Map();
-    for (const edge of rawEdges) {
-        if (!rawOut.has(edge.from)) rawOut.set(edge.from, []);
-        rawOut.get(edge.from).push(edge.to);
-    }
-    // 返回 { ids, hops }：hops > 0 说明经过了被丢弃的节点，这条边是推断出来的。
-    const resolveEnds = (id, depth) => {
-        const mapped = idToCanonical.get(id);
-        if (mapped && ids.has(mapped)) return { ids: [mapped], hops: 0 };
-        if (depth >= 2) return { ids: [], hops: 0 };
-        const next = rawOut.get(id) || [];
-        // 只有"恰好一个后继"时才短路：被丢掉的若是扇形枢纽（一个父节点连 8 个子公司），
-        // 展开会把兄弟节点两两连成网状假边（实测 6 个节点被连成 30 条边）。
-        if (next.length !== 1) return { ids: [], hops: 0 };
-        const deeper = resolveEnds(next[0], depth + 1);
-        return { ids: deeper.ids, hops: deeper.hops + 1 };
-    };
-
+    // 以前这里会把"被丢掉的节点"的前驱直接接到它的后继上，以免主干断开。实测这个
+    // 补救的代价远大于收益：
+    //   `Input → 64 → Output` 里 64 被当编号丢掉后，变成 `Input → Output`，
+    //   还标成"推断边"。下游助手看到的是"Input 直接依赖 Output"，而原图只说明
+    //   "Input 的结果先经过 64 这一步"。
+    //
+    // 而且现在 isNoiseLabel 只删纯符号，被丢的节点已经极少，"故意断链"几乎不会发生。
+    // 万一某条边因为端点被删而悬空，就让它自然消失 —— 少一条边，比多一条假边好。
     const edges = [];
     const seenEdge = new Set();
     const fanoutOf = new Map();
     let speculatedEdges = 0;
     for (const edge of rawEdges) {
-        const fromSide = resolveEnds(edge.from, 0);
-        const toSide = resolveEnds(edge.to, 0);
-        // 任一端经过被丢弃的节点，这条边就是推断出来的
-        const speculated = fromSide.hops > 0 || toSide.hops > 0;
-        for (const from of fromSide.ids) {
-            for (const to of toSide.ids) {
-                if (from === to) continue; // 合并/短路后产生的自环直接丢
-                // 注意：**不能**按"标签相同就不连"过滤 —— 连续的同类模块（VGG19 的三层 4096、
-                // 堆叠的 Add & Norm）本来就走同一条链，按标签删边会把它们整段拆断。
-                const key = `${from}>${to}`;
-                if (seenEdge.has(key)) continue;
-                seenEdge.add(key);
-                // 同一节点扇出太多会画成一团交叉箭头，按上限截断（先到先得）。
-                const fanout = fanoutOf.get(from) || 0;
-                if (fanout >= DIAGRAM_MAX_FANOUT) continue;
-                fanoutOf.set(from, fanout + 1);
-                const record = { from, to, label: edge.label };
-                if (speculated) {
-                    record.speculated = true;
-                    speculatedEdges += 1;
-                }
-                edges.push(record);
-            }
-        }
+        const from = idToCanonical.get(edge.from);
+        const to = idToCanonical.get(edge.to);
+        // 端点不存在（被当纯符号删了，或模型写了不存在的 id）→ 这条边不成立
+        if (!from || !to || from === to) continue;
+        if (!ids.has(from) || !ids.has(to)) continue;
+        // 去重键必须带上**边标签**：同一对节点之间可以有多条含义不同的连线
+        // （实测 `Client→Service[Request]` 与 `Client→Service[Retry]` 是两条独立的
+        // 交互，只按 from>to 去重会把 Retry 那条吃掉）。
+        const label = String(edge.label == null ? '' : edge.label).trim();
+        const key = `${from}>${to}>${label}`;
+        if (seenEdge.has(key)) continue;
+        seenEdge.add(key);
+        // 同一节点扇出太多会画成一团交叉箭头，按上限截断（先到先得）。
+        const fanout = fanoutOf.get(from) || 0;
+        if (fanout >= DIAGRAM_MAX_FANOUT) continue;
+        fanoutOf.set(from, fanout + 1);
+        edges.push({ from, to, label: edge.label });
         // 同理不按数量 break：边也要全部收进来，超限由 shrinkGraph 统一裁。
     }
 
@@ -731,14 +751,25 @@ function parseGraph(text) {
     // 否则同名重复节点之间的边会变成自环、重复边，看着就像逻辑错了。
     const collapsed = mergeRedundantNodes(nodes, edges);
 
-    // 一条边都不沾的节点就是"漂浮的标签"（实测原图的行标题 输入层/正向LSTM 被当成节点），
-    // 它们不承载结构，画出来只会让人以为图里有多余模块 —— 直接丢。
+    // 一条边都不沾的节点 = 模型**没认出它和谁相连**。
+    //
+    // 原来一刀切"直接丢"，理由是它可能是漂浮的版面标注（如行标题 输入层/正向LSTM）。
+    // 但实测一个真实的组织架构图：「综合业务产品线」这个最顶上的标题框模型没认出来，
+    // 于是它下面 7 个单位全都没了上级；其中「综合规划部」「西安研发中心」
+    // 「南京第二研发中心」本身没有下属，成了孤立点，被这里静默删掉 ——
+    // 一个好端端的部门就这么消失了，而且**没有任何计数、没有任何警告**。
+    //
+    // 现在改成：**全部保留**，并把名字报出去。理由：
+    //   - 少了部门是硬伤（对话助手永远不知道它存在），多了个孤立框只是不够美观；
+    //   - 纯符号/编号类的假节点在建节点时已经被 isNoiseLabel 筛掉（到不了这里），
+    //     所以这里剩下的都是有名字的真实方框，不该再删。
     const connected = new Set();
     for (const edge of collapsed.edges) {
         connected.add(edge.from);
         connected.add(edge.to);
     }
-    const keptNodes = collapsed.nodes.filter((node) => connected.has(node.id));
+    const orphanNodes = collapsed.nodes.filter((node) => !connected.has(node.id));
+    const keptNodes = collapsed.nodes;
     if (keptNodes.length < DIAGRAM_MIN_NODES) return null;
 
     let title = typeof data.title === 'string' ? data.title.replace(/\s+/g, ' ').trim() : '';
@@ -762,9 +793,79 @@ function parseGraph(text) {
     // 模型数错是常事，硬拦会把正常图挡回去。
     const declared = Number(data.boxCount);
     shrunk.declaredBoxCount = Number.isInteger(declared) && declared > 0 ? declared : null;
+    // 孤立点：模型没认出它们和谁相连。它们是要人看的地方 ——
+    // 「综合规划部」这种部门没有上级，往往是顶层标题框没被认出来。
+    shrunk.orphanNodes = orphanNodes.map((node) => node.label);
     // 「平级兄弟被读成一条链」的自检：这种错的节点数是对的，只能靠结构指纹发现。
     shrunk.serializedSiblings = detectSerializedSiblings(shrunk);
+    // 平级分组：模型自己圈出的"这批是兄弟"。只保留仍在图上的成员。
+    shrunk.groups = parseGroups(data.groups, shrunk.nodes);
+    // 组内互连 = 兄弟之间画了隶属线，和"已圈成一组"自相矛盾，作为可疑信号报出去。
+    shrunk.groupsWithInnerEdges = countGroupInnerEdges(shrunk.groups, shrunk.edges);
     return shrunk;
+}
+
+/**
+ * 校验模型给的 groups。
+ *
+ * 口径（都是为了"宁可少分组，也不能分错组"）：
+ * - 成员 id 必须在图里、且去重后仍不少于 2 个；
+ * - **同一个节点只能属于一个组** —— 一个部门在两个组里，说明模型自己没想清楚层级，
+ *   这种组直接丢掉整个组，而不是挑一个留着（挑哪个都是猜）；
+ * - 组名只做展示，允许为空（渲染时用一个通用标签）。
+ *
+ * 不做的事：不因为"组内存在互连"就拆组 —— 组是模型的判断，互连是另一个独立信号，
+ * 由 countGroupInnerEdges 单独计数告警，两者互不掩盖。
+ *
+ * @param {*} raw 模型给的 groups 字段（任意类型）
+ * @param {Array<{id: string, label: string}>} nodes 已校验的节点
+ * @returns {Array<{label: string, members: string[]}>}
+ */
+function parseGroups(raw, nodes) {
+    if (!Array.isArray(raw)) return [];
+    const valid = new Set(nodes.map((node) => node.id));
+    const claimed = new Set();
+    const groups = [];
+    for (const item of raw) {
+        if (!item || typeof item !== 'object') continue;
+        const label = String(item.label == null ? '' : item.label).replace(/\s+/g, ' ').trim();
+        const members = [];
+        const localSeen = new Set();
+        for (const id of Array.isArray(item.members) ? item.members : []) {
+            const key = String(id == null ? '' : id).trim();
+            if (!key || !valid.has(key) || localSeen.has(key)) continue;
+            localSeen.add(key);
+            members.push(key);
+        }
+        if (members.length < DIAGRAM_GROUP_MIN_MEMBERS) continue;
+        // 一对多归属：只要有一个成员已经被上一组认领，这整组就不要了。
+        if (members.some((id) => claimed.has(id))) continue;
+        for (const id of members) claimed.add(id);
+        groups.push({ label, members });
+    }
+    return groups;
+}
+
+/**
+ * 统计"组内成员之间被连了线"的组数与边数。
+ *
+ * 这是最硬的矛盾证据：模型自己说这批是兄弟（同一组、平级），却又给了它们上下级连线。
+ * 两种可能——分组错了，或者连线错了——无论哪种，这张图都值得人看一眼。
+ *
+ * @returns {{groups: number, edges: number, samples: string[]}}
+ */
+function countGroupInnerEdges(groups, edges) {
+    const result = { groups: 0, edges: 0, samples: [] };
+    if (!Array.isArray(groups) || groups.length === 0) return result;
+    for (const group of groups) {
+        const inside = new Set(group.members);
+        const inner = edges.filter((edge) => inside.has(edge.from) && inside.has(edge.to));
+        if (inner.length === 0) continue;
+        result.groups += 1;
+        result.edges += inner.length;
+        if (result.samples.length < 3) result.samples.push(inner.length);
+    }
+    return result;
 }
 
 /**
@@ -936,10 +1037,34 @@ function renderPuml(graph) {
     // 高度可以正常滚动，宽度不能溢出。
     const lines = ['@startuml', 'top to bottom direction'];
     if (graph.title) lines.push(`title ${sanitizePumlLabel(graph.title)}`);
+    // 平级分组：组内成员包进 package{}，读者一眼能看出"这些是兄弟、不是上下级"。
+    // 只包真正还在图上的成员；成员不足 2 个的组不包（package 里一个框没有意义）。
+    const groupOf = new Map();
+    for (const group of Array.isArray(graph.groups) ? graph.groups : []) {
+        const members = (Array.isArray(group.members) ? group.members : []).filter((id) => graph.nodes.some((node) => node.id === id));
+        if (members.length < DIAGRAM_GROUP_MIN_MEMBERS) continue;
+        groupOf.set(group, members);
+    }
     graph.nodes.forEach((node, index) => {
         const name = `n${index + 1}`;
         alias.set(node.id, name);
-        lines.push(`rectangle "${sanitizePumlLabel(node.label)}" as ${name}`);
+    });
+    // 先把组包好、组内成员声明进去，再补上不属于任何组的节点。
+    const grouped = new Set();
+    for (const [group, members] of groupOf) {
+        const label = sanitizePumlLabel(group.label || '平级单位');
+        lines.push(`package "${label}" {`);
+        for (const id of members) {
+            const node = graph.nodes.find((item) => item.id === id);
+            if (!node || grouped.has(id)) continue;
+            grouped.add(id);
+            lines.push(`  rectangle "${sanitizePumlLabel(node.label)}" as ${alias.get(id)}`);
+        }
+        lines.push('}');
+    }
+    graph.nodes.forEach((node) => {
+        if (grouped.has(node.id)) return;
+        lines.push(`rectangle "${sanitizePumlLabel(node.label)}" as ${alias.get(node.id)}`);
     });
     for (const edge of graph.edges) {
         const from = alias.get(edge.from);
@@ -955,58 +1080,174 @@ function renderPuml(graph) {
     return lines.join('\n');
 }
 
+/**
+ * 把图压成一段"给人看的层级说明"，用于自检。
+ *
+ * 只给**结构**，不给图：让模型在看不到原图的情况下，只读自己的产物回答
+ * "谁归谁管"。这样问出来的答案反映的是数据本身的问题，而不是又看了一遍图、
+ * 重复同一个错误。
+ */
+function describeHierarchyForCheck(graph) {
+    const labelOf = new Map(graph.nodes.map((node) => [node.id, node.label]));
+    const childrenOf = new Map();
+    for (const edge of graph.edges) {
+        if (!childrenOf.has(edge.from)) childrenOf.set(edge.from, []);
+        childrenOf.get(edge.from).push(edge.to);
+    }
+    const lines = [];
+    for (const [parent, children] of childrenOf) {
+        const names = children.map((id) => labelOf.get(id) || id).slice(0, 20);
+        lines.push(`${labelOf.get(parent) || parent} 的直接下级（${children.length} 个）：${names.join('、')}`);
+    }
+    // 分组信息一起给：它决定了"哪些本来是兄弟"。
+    for (const group of Array.isArray(graph.groups) ? graph.groups : []) {
+        const names = group.members.map((id) => labelOf.get(id) || id);
+        lines.push(`平级分组「${group.label || '未命名'}」：${names.join('、')}`);
+    }
+    return lines.join('\n');
+}
 
 /**
- * 只去掉"两家说法相反"的边：主模型给 A→B、复核模型给 B→A，说明这条边的方向读不准，
- * 删掉；其余边全部保留。
+ * 自检提示词：只读结构、不看图，回答三个能直接判定对错的问题。
  *
- * 为什么不用"取交集"：两个模型在"自下而上"这类图上常整套读反，交集会把整条链拆成碎片
- * （实测 Transformer 只剩 3 条边）。只删方向矛盾的边，既保住了结构，又不会画出反的箭头。
+ * 为什么这样问有效：模型读图时错在"把并列读成上下级"，
+ * 但**同样的结构摆成文字，它几乎不会犯这个错** —— 文字里"直接下级（26 个）"是明摆的事实。
+ * 所以用它的强项（读文字）去校验它的弱项（读版面），能把这类错挑出来。
+ */
+function buildCheckPrompt(graph) {
+    return (
+        '下面是一张组织/流程结构图的机器生成结果，**你看不到原图**，只能读这些文字。\n\n' +
+        `${describeHierarchyForCheck(graph)}\n\n` +
+        '请只根据上面的文字回答，不要猜测、不要补全你没看到的内容：\n' +
+        '1. 有没有哪个节点"直接下级"的数量大得反常，而它本来应该只是一条链上的一环？有就说出名字。\n' +
+        '2. 有没有哪一组本来是平级的方框，被连成了"第一个管第二个"的链？有就说出名字。\n' +
+        '3. 除了第 1、2 条，还有没有明显的层级矛盾（例如某节点既是 A 的下级又被列进与 A 同级的组）？\n\n' +
+        '如果都没有问题，只回答 `OK`。\n' +
+        '如果发现问题，第一行写 `PROBLEM`，后面一行一条简述问题，不要写代码、不要复述结构。'
+    );
+}
+
+/**
+ * 解析自检结果：首词 OK 判无问题，其余一律当"有问题"并返回原文供告警引用。
+ *
+ * 和 parseKind 一样按**首词**判断，不全文搜关键词 —— 模型常回
+ * "没有发现 PROBLEM" 这类反话，全文匹配会把它误判成有问题。
+ *
+ * @returns {{problem: boolean, detail: string}}
+ */
+function parseCheckResult(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return { problem: false, detail: '' };
+    const first = raw.split(/\s+/)[0].replace(/[`*:：]/g, '').toUpperCase();
+    if (first === 'OK') return { problem: false, detail: '' };
+    // 中文回答："没有发现问题" 也算通过
+    if (/^(没有|无).{0,4}(问题|矛盾|异常)/.test(raw)) return { problem: false, detail: '' };
+    return { problem: true, detail: raw.split('\n').slice(0, 4).join(' ').slice(0, 300) };
+}
+
+
+/**
+ * 用复核结果校正主模型：**只仲裁有争议的边，绝不删节点、绝不丢元数据**。
+ *
+ * 三条原则（按重要性）：
+ *
+ * 1. **关系有争议 ≠ 节点不存在。** 早先这里的做法是"删掉边之后，把没有边的节点也一并去掉"，
+ *    于是「某部门」因为一条连线被否掉就从图里消失了。节点存在与否和连线对不对是两件事，
+ *    由不同的证据支撑，必须分开处理。
+ *
+ * 2. **不能只查"方向相反"。** 组织架构里最常见的错是**挂错上级**，不是把箭头读反：
+ *    主模型说 `B 归 A`、复核说 `B 直接归 Root` —— 两个方向都不冲突（一条 A→B、
+ *    一条 Root→B），旧逻辑完全看不见，会静默保留错的那个。
+ *
+ * 3. **元数据不能静默消失。** 返回值必须带上 `groups` 等字段，并按最终节点重新校验。
+ *    早先只返回 `{title, nodes, edges}`，分组信息凭空蒸发。
+ *
+ * 争端处理：**只记录、不改图**。理由和别处一致 —— 删边会让草图缺东西，
+ * 而"缺"比"错"更难发现；把争议写进 `conflicts` 交给人看，比替人做决定安全。
  *
  * 节点按**标签**对齐（id 是模型自己编的，两次不可能一样）。
  *
- * @returns {{title: string, nodes: Array, edges: Array}|null} 剩下的太少则返回 null
+ * @returns {{title, nodes, edges, groups, conflicts, ...}|null} 剩下的太少则返回 null
  */
 function subtractContradictions(primary, judge) {
     if (!primary) return null;
     if (!judge) return primary;
-    const keyOf = (labelOf) => (edge) => {
-        const from = labelOf.get(edge.from);
-        const to = labelOf.get(edge.to);
+    const labelOf = (graph) => new Map((graph.nodes || []).map((node) => [node.id, node.label]));
+    const primaryLabel = labelOf(primary);
+    const judgeLabel = labelOf(judge);
+    const keyOf = (labelMap) => (edge) => {
+        const from = labelMap.get(edge.from);
+        const to = labelMap.get(edge.to);
         return from && to ? `${from}→${to}` : '';
     };
-    const primaryKey = keyOf(new Map(primary.nodes.map((node) => [node.id, node.label])));
-    const judgeKey = keyOf(new Map(judge.nodes.map((node) => [node.id, node.label])));
+    const primaryKey = keyOf(primaryLabel);
+    const judgeKey = keyOf(judgeLabel);
 
     const judgeEdges = new Set();
+    const judgeParents = new Map(); // 子标签 → Set(父标签)，用于识别"挂错上级"
     for (const edge of judge.edges) {
         const key = judgeKey(edge);
         if (key) judgeEdges.add(key);
+        const child = judgeLabel.get(edge.to);
+        const parent = judgeLabel.get(edge.from);
+        if (child && parent) {
+            if (!judgeParents.has(child)) judgeParents.set(child, new Set());
+            judgeParents.get(child).add(parent);
+        }
     }
+
     const edges = [];
+    const conflicts = { reversed: 0, wrong_parent: [], judge_only: 0, primary_only: 0 };
     for (const edge of primary.edges) {
         const key = primaryKey(edge);
         if (!key) continue;
         const cut = key.indexOf('→');
         const reversed = `${key.slice(cut + 1)}→${key.slice(0, cut)}`;
-        if (judgeEdges.has(reversed)) continue; // 方向被另一个模型否定
+        // 方向被另一个模型明确否定 → 这条边的方向读不准，删掉（这是唯一还会删边的情形）
+        if (judgeEdges.has(reversed)) {
+            conflicts.reversed += 1;
+            continue;
+        }
         edges.push(edge);
     }
-    if (edges.length < DIAGRAM_MIN_EDGES) return null;
-    // 边被删掉后变孤立的节点一并去掉，不画漂浮框。
-    const used = new Set();
-    for (const edge of edges) {
-        used.add(edge.from);
-        used.add(edge.to);
+
+    // 挂错上级：主模型给 A→B，但复核模型认为 B 的上级**另有其人**（且不是 A）。
+    // 不改图，只记录 —— 这是组织架构里最有价值的一条告警。
+    for (const edge of primary.edges) {
+        const child = primaryLabel.get(edge.to);
+        const parent = primaryLabel.get(edge.from);
+        if (!child || !parent) continue;
+        const judgeParentsOfChild = judgeParents.get(child);
+        if (!judgeParentsOfChild || judgeParentsOfChild.size === 0) continue;
+        if (judgeParentsOfChild.has(parent)) continue; // 两边一致
+        if (conflicts.wrong_parent.length < 5) {
+            conflicts.wrong_parent.push({
+                child,
+                primary_parent: parent,
+                judge_parents: [...judgeParentsOfChild],
+            });
+        } else {
+            conflicts.wrong_parent.length = 5; // 只留前 5 条样本
+        }
     }
-    const nodes = primary.nodes.filter((node) => used.has(node.id));
+
+    // 两个模型各有一部分独有的边：只计数，用于判断"两边读得一样不一样"
+    const primaryEdgeSet = new Set(primary.edges.map(primaryKey).filter(Boolean));
+    for (const key of judgeEdges) if (!primaryEdgeSet.has(key)) conflicts.judge_only += 1;
+    for (const key of primaryEdgeSet) if (!judgeEdges.has(key)) conflicts.primary_only += 1;
+
+    if (edges.length < DIAGRAM_MIN_EDGES) return null;
+
+    // **节点一律保留主模型的全部**，不因为某条边没了就删节点。
+    // 孤立的节点由 parseGraph 那边统一报 `orphans`，不在这里静默处理。
+    const nodes = primary.nodes;
     if (nodes.length < DIAGRAM_MIN_NODES) return null;
 
     // 节点集比对（只告警，不改图）。
     //
-    // 上面的逻辑只仲裁"边方向"，从不比较两个模型各认出多少个节点。两个模型都
-    // 漏掉同一个部门时，没有任何一方会提出异议 —— 图上少画一个部门，等于在组织
-    // 文件里凭空撤销它。缺节点比多一条线更危险：多一条线看得见，少一个部门是空白。
+    // 两个模型都漏掉同一个部门时，没有任何一方会提出异议 —— 图上少画一个部门，
+    // 等于在组织文件里凭空撤销它。缺节点比多一条线更危险：多一条线看得见，
+    // 少一个部门是空白。
     //
     // 为什么不把复核多出的节点补进去：复核模型也可能幻觉出不存在的部门，贸然补
     // 进去等于用一个未经验证的猜测制造新错误。这里只如实报告数量，由人判断。
@@ -1018,18 +1259,27 @@ function subtractContradictions(primary, judge) {
         );
     const primaryLabels = labelSet(primary);
     const judgeLabels = labelSet(judge);
-    let missingFromPrimary = 0;
-    let extraInPrimary = 0;
-    for (const label of judgeLabels) if (!primaryLabels.has(label)) missingFromPrimary += 1;
-    for (const label of primaryLabels) if (!judgeLabels.has(label)) extraInPrimary += 1;
+    const missingFromPrimary = [...judgeLabels].filter((label) => !primaryLabels.has(label)).length;
+    const extraInPrimary = [...primaryLabels].filter((label) => !judgeLabels.has(label)).length;
+
+    // 分组按最终节点集**重新校验**：成员全被保留才算数，别让 groups 悄悄消失。
+    const keptIds = new Set(nodes.map((node) => node.id));
+    const groups = (Array.isArray(primary.groups) ? primary.groups : [])
+        .map((group) => ({
+            label: group.label,
+            members: (group.members || []).filter((id) => keptIds.has(id)),
+        }))
+        .filter((group) => group.members.length >= DIAGRAM_GROUP_MIN_MEMBERS);
 
     return {
-        title: primary.title,
+        ...primary, // 带上 title、truncatedLabels、declaredBoxCount 等全部元数据
         nodes,
         edges,
-        speculatedEdges: (primary.speculatedEdges || 0),
+        groups,
+        speculatedEdges: edges.filter((edge) => edge.speculated).length,
         missingFromPrimary,
         extraInPrimary,
+        conflicts,
     };
 }
 
@@ -1148,51 +1398,27 @@ function fitGraph(graph) {
 }
 
 /**
- * 合并"完全冗余"的节点：标签相同、且**邻居 id 完全一致**的多个节点其实是同一个框。
+ * 节点去重 —— **默认什么都不做**。
  *
- * 为什么必须用邻居 id 而不是标签：VGG19 那种 `512→512→512` 的长链里，每个中间节点的
- * 邻居"标签"都一样（前一个 512、后一个 512），按标签判就会把整条链压成一个节点。
- * 按 id 判则只有真正的重复（同一个框被模型写成三个 id）才会命中 —— 实测 BiLSTM 的
- * `h_t-1` 被拆成三个，导致 `h_t-1 → h_t-1` 自环与重复边。
+ * 以前这里会把"标签相同、且邻居 id 完全一致"的多个节点合并成一个，理由是
+ * "同一个框被模型写成了两个 id"。但实测这个前提站不住：
+ *
+ *   Input 同时连两个独立的 Worker，两个 Worker 又各自连 Output
+ *   → 两个 Worker 标签相同、邻居签名也相同 → 被合并成一个
+ *
+ * 两个并行分支、两个副本、两个同名部门、两个相同算子（ResNet 里的两个
+ * `conv3x3`），**完全可以既同名又同邻居**。拓扑相似不能证明它们是同一个视觉实体。
+ *
+ * 反过来，"同一个框被写成两个 id"这件事，模型本来也很少犯；就算犯了，后果只是
+ * 多一个框。而错误合并的后果是**两条并行支路凭空少掉一条**，下游助手再也看不到它。
+ *
+ * 所以这里只保留函数形状（调用方不用改），但**不再删除任何节点**。
+ * 将来若引入裁图识别，可以结合原图坐标、裁图来源判断重复 —— 那才是有依据的合并。
  *
  * @returns {{nodes: Array, edges: Array, merged: number}}
  */
 function mergeRedundantNodes(nodes, edges) {
-    const signature = (node) => {
-        const parts = [];
-        for (const edge of edges) {
-            if (edge.from === node.id) parts.push(`>${edge.to}`);
-            if (edge.to === node.id) parts.push(`<${edge.from}`);
-        }
-        return parts.sort().join('|');
-    };
-    const firstOf = new Map();
-    const remap = new Map();
-    const kept = [];
-    for (const node of nodes) {
-        const key = `${node.label}#${signature(node)}`;
-        const existing = firstOf.get(key);
-        if (existing) {
-            remap.set(node.id, existing);
-            continue;
-        }
-        firstOf.set(key, node.id);
-        remap.set(node.id, node.id);
-        kept.push(node);
-    }
-    if (kept.length === nodes.length) return { nodes, edges, merged: 0 };
-    const seen = new Set();
-    const nextEdges = [];
-    for (const edge of edges) {
-        const from = remap.get(edge.from);
-        const to = remap.get(edge.to);
-        if (!from || !to || from === to) continue; // 合并后产生的自环直接丢
-        const key = `${from}>${to}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        nextEdges.push({ from, to, label: edge.label });
-    }
-    return { nodes: kept, edges: nextEdges, merged: nodes.length - kept.length };
+    return { nodes, edges, merged: 0 };
 }
 
 /** 一张图的稳定标识：优先用 `path=` 参数（同一路径=同一张图），否则退回原地址。 */
@@ -1226,6 +1452,21 @@ function resolveImageUrl(raw, config) {
 
 /** 从一段 md 里取图片地址（兼容 `![](...)`、`![](<...>)`、`<img src>`）。 */
 function collectRawRefs(text) {
+    return collectRawRefSpans(text).map((item) => item.raw);
+}
+
+/**
+ * 和 collectRawRefs 一样，但**同时给出每个引用在原文里的起止位置**。
+ *
+ * 为什么必须给位置：替换时只能动图片引用本身，前后的正文（`Before … After`）要原样保留。
+ * 早先按"整行替换"处理，行内插图前后的文字会一起丢掉。
+ *
+ * 返回的 span 覆盖整个 `![alt](url)`，不是只覆盖括号里的地址 —— 替换时整段换成链接。
+ *
+ * @returns {Array<{raw: string, url: string, start: number, end: number}>}
+ *   raw = 括号里的地址原文（未经 normalizeRawRef），start/end = 整个引用在 text 里的区间
+ */
+function collectRawRefSpans(text) {
     const source = String(text || '');
     const out = [];
     // `![](...)` 用括号配平扫描，而不是正则：地址里可能带括号（例如 data: 里的 (…)），
@@ -1256,12 +1497,16 @@ function collectRawRefs(text) {
             }
             index += 1;
         }
-        if (depth === 0) out.push(buffer);
+        if (depth === 0) out.push({ raw: buffer, start: open, end: index });
         cursor = index;
     }
     const imgRe = /<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)')/gi;
     let match;
-    while ((match = imgRe.exec(source))) out.push(match[1] || match[2] || '');
+    while ((match = imgRe.exec(source))) {
+        out.push({ raw: match[1] || match[2] || '', start: match.index, end: match.index + match[0].length });
+    }
+    // `<img>` 的位置是按正则顺序附加在后面的，混在一起按起点排一下，保证替换时游标单调。
+    out.sort((a, b) => a.start - b.start);
     return out;
 }
 
@@ -1356,23 +1601,44 @@ function injectDescriptions(md, descByKey) {
             removed += 1;
             continue;
         }
+        // 这一行里的**全部**图片引用，带它们在原字符串中的准确位置。
+        // 位置必须留着：替换要"只换图片本身"，前后正文一个字都不能动。
         const refs = [];
-        for (const rawRef of collectRawRefs(line)) {
-            const raw = normalizeRawRef(rawRef);
+        for (const span of collectRawRefSpans(line)) {
+            const raw = normalizeRawRef(span.raw);
             if (!raw) continue;
             const key = refKey(raw);
-            if (!refs.some((item) => item.key === key)) refs.push({ key, raw });
+            // 同一张图在一行里出现多次：只在**第一处**插描述块，避免同样的草图连贴几遍。
+            // 但每个位置的图片引用都要换成链接。
+            const isFirstOfKey = !refs.some((item) => item.key === key);
+            refs.push({ key, raw, start: span.start, end: span.end, isFirstOfKey });
         }
-        const keys = refs.filter((item) => descByKey.has(item.key)).map((item) => item.key);
-        for (const key of keys) {
-            for (const inserted of describeInsertLines(descByKey.get(key), insertEol)) out.push(inserted);
+        if (refs.length === 0) {
+            out.push(line);
+            continue;
+        }
+        // 有描述的图：先在**这一行之前**按出现顺序插入各自的描述块。
+        for (const ref of refs) {
+            if (!ref.isFirstOfKey || !descByKey.has(ref.key)) continue;
+            for (const inserted of describeInsertLines(descByKey.get(ref.key), insertEol)) out.push(inserted);
             injected += 1;
         }
-        // 无论这张图出的是草图还是注释，原图都不再嵌进正文（图大、且与产出重复），
-        // 只留一行可点链接，需要对照时点开原图。
-        const replaceWithLink = refs.length === 1 && keys.length === 1;
-        if (replaceWithLink) out.push(`${DIAGRAM_IMAGE_LINK_PREFIX}${refs[0].raw})${insertEol}`);
-        else out.push(line);
+        // 再**就地**把每个图片引用换成 `[原图](地址)`，前后正文原样保留。
+        //
+        // 早先这里只要"这一行只有一张图 AND 这张图有描述"就把**整行**替换掉：
+        //   `Before ![figure](img.png) After`  变成  `[原图](img.png)`
+        // Before / After 两个词直接消失。工具的职责是**增加**图片信息，
+        // 不能因为处理图片反而删掉原文。
+        let rebuilt = '';
+        let cursor = 0;
+        for (const ref of refs) {
+            if (ref.start < cursor) continue; // 保险：不重叠替换
+            rebuilt += line.slice(cursor, ref.start);
+            rebuilt += `${DIAGRAM_IMAGE_LINK_PREFIX}${ref.raw})`;
+            cursor = ref.end;
+        }
+        rebuilt += line.slice(cursor);
+        out.push(rebuilt.endsWith(insertEol) ? rebuilt : `${rebuilt}${insertEol}`);
     }
     return { content: out.join('\n'), injected, removed };
 }
@@ -1698,7 +1964,8 @@ function buildPrompt(docNameText, index, total, diagramMode, declaredBoxCount) {
         'A. 结构图（流程图、架构图、结构示意图、框图、时序图、状态图 —— 信息只能通过"谁连着谁、谁包含谁、' +
         '怎么分支、怎么汇合"表达，去掉方框和箭头信息就没了）：只输出一个 JSON 对象，别的什么都不要写：\n' +
         '{"title":"图的标题，没有就空串","boxCount":图上方框总数,"nodes":[{"id":"n1","label":"图中原文"}],' +
-        '"edges":[{"from":"n1","to":"n2","label":"箭头上或线上的文字"}]}\n' +
+        '"edges":[{"from":"n1","to":"n2","label":"箭头上或线上的文字"}],' +
+        '"groups":[{"label":"这一组的名字","members":["n1","n2"]}]}\n' +
         '   规则（按重要性，每条都对应实测踩过的坑）：\n' +
         // 这里原来写着"节点不超过 20 个"，而代码侧上限是 80 —— 图上 25 个部门时模型会主动
         // 只写 20 个，等于工具自己让模型漏读。产物是给对话助手读的代码，少一个方框就等于
@@ -1733,13 +2000,31 @@ function buildPrompt(docNameText, index, total, diagramMode, declaredBoxCount) {
         // 实测（真实组织架构图）：一个事业群下面挂 6 个办公室 + 20 条产品线，全是平级、
         // 全不带箭头；模型按"名字从上往下念"的顺序连成一条链，结果 20 条产品线全挂到了
         // 最后一个办公室下面。节点一个不少，所以数量类校验完全看不出来。
-        '   10. 一个大标题（或大方框）下面并排的一排、一列小方框，是**同时**属于它的下级，' +
-        '不是"第一个管第二个、第二个管第三个"。只要它们在图上处于同一层、' +
-        '没有箭头指向彼此，就要**分别**从大标题各连一条线过去；' +
-        '绝不能按版面顺序把它们串成一条链。\n' +
+        //
+        // 只写"不许串成链"不管用 —— 那是在禁止一个行为，模型照样会犯。改成**先分组**：
+        // 让它自己把平级的框圈成一组，等于强制它回答"这些是兄弟还是上下级"。
+        // 一旦圈成群，它就不会再让组内成员首尾相连，渲染时也会包进 package{}。
+        '   10. **先分组，再连边**：同一层级、同属一个上级、彼此之间没有隶属关系的方框，' +
+        '必须放进 groups 里同一个成员列表。典型例子：一个大标题下面并排的一排 / 一列部门，' +
+        '它们**同时**属于这个大标题，不是"第一个管第二个、第二个管第三个"。\n' +
+        '        · groups 每项形如 {"label":"这组叫什么","members":["n3","n4","n5"]}；\n' +
+        '        · 成员用节点的 id；一组至少 2 个成员；同一个节点只能属于一组；\n' +
+        '        · 一组内的节点**互相之间不要连边** —— 它们是兄弟，兄弟之间没有上下级关系；\n' +
+        '        · 上级分别连到组里每一个成员，不要串成链、也不要只连第一个。\n' +
         '   11. 竖排或横排的部门名 / 条目名挤在一起、彼此只有分隔线而**没有箭头**时，' +
         '方向只可能是"上面管下面""左边管右边"：找出它们共同归属的那个上级，' +
-        '让上级分别连到每一个，不要按名字排列顺序连成串。\n' +
+        '让上级分别连到每一个，并且把它们放进同一个 group；千万不要按名字排列顺序连成串。\n' +
+        '   12. 输出前自查一遍 groups：图里凡是"并排出现、样式相同、同一层"的一批方框，' +
+        '都应该出现在某个 group 里。漏掉分组，后面的边就很容易画错。\n' +
+        // 实测（真实组织架构图）：图最顶上那个橙色标题框「综合业务产品线」模型没认出来，
+        // 于是它下面 7 个单位全都没有上级，其中 3 个还因此变成孤立点。
+        // 顶部的标题框是整个层级的锚点，漏了它，下面的边就全乱了。
+        '   13. **图最顶上的那个框（标题框、总标题）也是一个节点**，必须列进 nodes，' +
+        '并从它向下连到它直接管辖的所有方框。哪怕它看起来像"图的标题"而不是"一个方框"，' +
+        '只要它有框、有线往下连，它就是层级里的最顶层，不能只写进 title 就完事。\n' +
+        '   14. 输出前数一遍：**每个方框都必须至少有一条边连着**。如果发现某个框一条边都没有，' +
+        '说明你漏了它的连线——请回去看图，找到它和谁相连（多半是顶上的标题框没认出来），' +
+        '而不是把它删掉。\n' +
         'B. 其它图（海报/宣传图/分层色块的版式图、照片、界面截图、纯文字、曲线图、柱状图、表格等）：' +
         '按下面的规则写中文描述。\n' +
         // 复用同一段描述规则文本，保证"结构图关掉"与"其它图"两条路径逐字一致。
@@ -2044,6 +2329,33 @@ async function describeOneImage(ref, visionConfig, ctx, position) {
                         ctx.diagramDualFallback += 1;
                     }
                 }
+                // 自检（不看图，只读自己的产物）：专抓"节点数对得上、但层级读错"的错，
+                // 例如把 20 条平级产品线连成一条链。这类错 boxCount 自检完全看不见。
+                // 只在**结构可疑**时触发（有串链指纹，或有组内互连），不是每张都花这次调用。
+                const suspectForCheck =
+                    Boolean(finalGraph.serializedSiblings) ||
+                    (finalGraph.groupsWithInnerEdges && finalGraph.groupsWithInnerEdges.groups > 0);
+                if (suspectForCheck) {
+                    ctx.diagramChecked += 1;
+                    try {
+                        const check = await vision.completeText({
+                            baseUrl: visionConfig.url,
+                            apiKey: visionConfig.key,
+                            model: visionConfig.model,
+                            prompt: buildCheckPrompt(finalGraph),
+                            maxTokens: 800,
+                            state: ctx.state,
+                        });
+                        if (check.rateLimited) ctx.rateLimited += check.rateLimited;
+                        const verdict = parseCheckResult(check.text);
+                        if (verdict.problem) {
+                            ctx.diagramCheckFailed += 1;
+                            if (ctx.diagramCheckSamples.length < 3) ctx.diagramCheckSamples.push(verdict.detail);
+                        }
+                    } catch {
+                        // 自检失败不影响出图：它只是额外一层提醒。
+                    }
+                }
                 const fitted = fitGraph(finalGraph) || finalGraph;
                 const puml = renderPuml(fitted);
                 if (puml) {
@@ -2057,6 +2369,16 @@ async function describeOneImage(ref, visionConfig, ctx, position) {
                     if (finalGraph.missingFromPrimary) {
                         ctx.diagramMissingFromPrimary += finalGraph.missingFromPrimary;
                     }
+                    // 复核发现的**挂错上级**：主模型说 B 归 A，复核说 B 归 Root。
+                    // 这是组织架构里最常见的错，且方向不冲突、旧逻辑完全看不见。
+                    if (finalGraph.conflicts && Array.isArray(finalGraph.conflicts.wrong_parent)) {
+                        for (const item of finalGraph.conflicts.wrong_parent) {
+                            if (ctx.diagramWrongParentSamples.length < 5) {
+                                ctx.diagramWrongParentSamples.push(item);
+                            }
+                            ctx.diagramWrongParent += 1;
+                        }
+                    }
                     // 节点名被截断（可能是部门名被改名），记原名供回溯。
                     if (Array.isArray(fitted.truncatedLabels) && fitted.truncatedLabels.length) {
                         ctx.diagramLabelsTruncated += fitted.truncatedLabels.length;
@@ -2069,6 +2391,24 @@ async function describeOneImage(ref, visionConfig, ctx, position) {
                         ctx.diagramSerialized += 1;
                         if (ctx.diagramSerializedSamples.length < 3) {
                             ctx.diagramSerializedSamples.push(fitted.serializedSiblings);
+                        }
+                    }
+                    // 平级分组：有分组说明模型自己确认了"这些是兄弟"。
+                    if (Array.isArray(fitted.groups) && fitted.groups.length) {
+                        ctx.diagramGrouped += 1;
+                        const inner = fitted.groupsWithInnerEdges;
+                        if (inner && inner.groups > 0) {
+                            ctx.diagramGroupInnerEdges += inner.edges;
+                            for (const n of inner.samples) {
+                                if (ctx.diagramGroupInnerSamples.length < 3) ctx.diagramGroupInnerSamples.push(n);
+                            }
+                        }
+                    }
+                    // 孤立点：模型没认出它们和谁相连，多半是顶层标题框漏了。
+                    if (Array.isArray(fitted.orphanNodes) && fitted.orphanNodes.length) {
+                        ctx.diagramOrphans += fitted.orphanNodes.length;
+                        for (const name of fitted.orphanNodes) {
+                            if (ctx.diagramOrphanSamples.length < 8) ctx.diagramOrphanSamples.push(name);
                         }
                     }
                     return { ok: true, kind: 'diagram', puml, ms: out.ms };
@@ -2249,15 +2589,29 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
         diagramSpeculated: 0,
         // 复核发现主模型漏认的节点总数：>0 说明主模型少画了东西
         diagramMissingFromPrimary: 0,
+        // 复核发现"挂错上级"的节点数，以及前几条样本 {child, primary_parent, judge_parents}
+        diagramWrongParent: 0,
+        diagramWrongParentSamples: [],
         // 节点名被截断的总数，以及前几条样本（原文 → 截断后）
         diagramLabelsTruncated: 0,
         diagramLabelSamples: [],
         // 模型自报方框数 > 实际列出数 的张数，以及补问后确实补回来的张数
         diagramUnderRead: 0,
         diagramUnderReadFixed: 0,
+        // 孤立点：模型没认出它们和谁相连。>0 说明可能有顶层标题框没被认出来。
+        diagramOrphans: 0,
+        diagramOrphanSamples: [],
         // 「平级兄弟被读成一条链」的张数，以及前几条样本（父节点 + 被串起来的边）
         diagramSerialized: 0,
         diagramSerializedSamples: [],
+        // 平级分组：有分组的张数与组内互连的组数（兄弟之间画了隶属线 = 自相矛盾）
+        diagramGrouped: 0,
+        diagramGroupInnerEdges: 0,
+        diagramGroupInnerSamples: [],
+        // 不看图重述自检：触发张数、判定有问题的张数、问题原文样本
+        diagramChecked: 0,
+        diagramCheckFailed: 0,
+        diagramCheckSamples: [],
         rateLimited: 0,
         truncated: 0,
         compressed: 0,
@@ -2355,6 +2709,44 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
                 `请对照原图确认层级关系。${samples ? `发现：${samples}` : ''}`,
         );
     }
+    // 孤立点：模型没认出它们和谁相连。这通常是顶层标题框没被认出来，
+    // 于是它下面那一层全都没有了上级。
+    if (ctx.diagramOrphans > 0) {
+        const samples = ctx.diagramOrphanSamples.length ? `（如：${ctx.diagramOrphanSamples.join('、')}）` : '';
+        warnings.push(
+            `DIAGRAM_ORPHAN：草图中 ${ctx.diagramOrphans} 个节点没有任何连线${samples}，` +
+                '模型没认出它们和谁相连 —— 多半是图最顶上的标题框漏成了 title、没算作节点，' +
+                '导致它下面一整层都没了上级。请对照原图确认这些节点的归属',
+        );
+    }
+    // 组内互连：模型自己说这批是兄弟，却又给了它们上下级连线 —— 硬矛盾。
+    if (ctx.diagramGroupInnerEdges > 0) {
+        warnings.push(
+            `DIAGRAM_GROUP_INNER：${ctx.diagramGroupInnerEdges} 条连线落在同一个平级分组内部` +
+                '（模型自己把成员圈成了兄弟，却又画了它们之间的上下级连线，两者自相矛盾），' +
+                '说明这张图的层级可能读错了，请对照原图确认',
+        );
+    }
+    // 不看图重述自检：只读产物本身就能看出的层级矛盾。
+    if (ctx.diagramCheckFailed > 0) {
+        const samples = ctx.diagramCheckSamples.length ? `，模型指出：${ctx.diagramCheckSamples.join('；')}` : '';
+        warnings.push(
+            `DIAGRAM_CHECK_FAILED：${ctx.diagramCheckFailed}/${ctx.diagramChecked} 张图的草图在「不看图、只读结构」的复述自检里被判为有层级矛盾` +
+                samples +
+                '；这类矛盾正是"节点数对得上但谁管谁错了"的表现，请对照原图确认',
+        );
+    }
+    // 挂错上级：组织架构里最常见的错，且方向不冲突 —— 只查"反向边"永远发现不了。
+    if (ctx.diagramWrongParent > 0) {
+        const samples = ctx.diagramWrongParentSamples
+            .map((item) => `「${item.child}」主模型挂在「${item.primary_parent}」下，复核认为归「${item.judge_parents.join('、')}」`)
+            .join('；');
+        warnings.push(
+            `DIAGRAM_WRONG_PARENT：${ctx.diagramWrongParent} 个节点的上级两个模型说法不同` +
+                `（这类错方向不冲突，只核对"反向边"发现不了）。` +
+                `草图保留了主模型的版本，请对照原图确认归属${samples ? `：${samples}` : ''}`,
+        );
+    }
     // 节点名被截断：可能是部门名被改名，必须把原名还回去。
     if (ctx.diagramLabelsTruncated > 0) {
         const samples = ctx.diagramLabelSamples
@@ -2369,7 +2761,17 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
     }
 
     if (descByKey.size === 0) {
-        throw new DocchainError('ALL_FAILED', `所有图片都没有生成描述（共 ${picked.length} 张），未保存。`);
+        // 把**每张图的失败原因**带出来。只说"全部失败"等于什么都没说：
+        // 用户既不知道是网络问题还是模型问题，也无从判断该不该重跑。
+        const detail = failed
+            .slice(0, 3)
+            .map((item) => `${item.error}: ${String(item.message || '').slice(0, 120)}`)
+            .join('；');
+        throw new DocchainError(
+            'ALL_FAILED',
+            `所有图片都没有生成描述（共 ${picked.length} 张），未保存。${detail ? `首个失败原因：${detail}` : ''}`,
+            { failed },
+        );
     }
 
     const injected = injectDescriptions(original, descByKey);
@@ -2406,13 +2808,23 @@ async function describeDocument(root, config, visionConfig, docId, params, say) 
             speculated: ctx.diagramSpeculated,
             // 复核看见、主模型漏认的节点数：非 0 说明草图可能少画
             missing_from_primary: ctx.diagramMissingFromPrimary,
+            // 复核认为上级不同的节点数（挂错上级）：方向不冲突，只能靠对比上级发现
+            wrong_parent: ctx.diagramWrongParent,
             // 被截断的节点名数量（原名见 warnings 里的 DIAGRAM_LABEL_TRUNCATED）
             labels_truncated: ctx.diagramLabelsTruncated,
             // 模型自报方框数比实际列出的多（它承认漏了）的张数，以及补问补回来的张数
             under_read: ctx.diagramUnderRead,
             under_read_fixed: ctx.diagramUnderReadFixed,
+            // 孤立节点数：模型没认出它们和谁相连，多半是顶层标题框漏了
+            orphans: ctx.diagramOrphans,
             // 平级兄弟被读成一条链的张数：节点数对得上，只能靠结构指纹发现
             serialized_siblings: ctx.diagramSerialized,
+            // 平级分组：grouped 是有分组的张数；group_inner_edges 是落在组内、自相矛盾的连线数
+            grouped: ctx.diagramGrouped,
+            group_inner_edges: ctx.diagramGroupInnerEdges,
+            // 不看图重述自检：checked 触发张数，check_failed 判定有问题的张数
+            checked: ctx.diagramChecked,
+            check_failed: ctx.diagramCheckFailed,
             // 复核：dual 是做了二次读图的张数，agreed 是交集可用的张数（其余退回主模型）。
             judge_model: ctx.judgeModel || null,
             dual: ctx.diagramDual,
@@ -2604,6 +3016,7 @@ module.exports = {
     detectSerializedSiblings,
     SERIAL_MIN_FANOUT,
     SERIAL_MIN_CHAIN_EDGES,
+    SERIAL_CHAIN_RATIO,
     truncateLabel,
     buildPrompt,
     buildKindPrompt,
@@ -2614,6 +3027,12 @@ module.exports = {
     DIAGRAM_MAX_LABEL_CHARS,
     DIAGRAM_MAX_PUML_CHARS,
     DIAGRAM_MAX_TOKENS,
+    DIAGRAM_GROUP_MIN_MEMBERS,
+    parseGroups,
+    countGroupInnerEdges,
+    buildCheckPrompt,
+    parseCheckResult,
+    describeHierarchyForCheck,
     DEFAULT_DIAGRAM_MODE,
     SENTINEL,
     DEFAULT_CONCURRENCY,

@@ -323,10 +323,39 @@ async function completeText(options) {
 }
 
 /**
+ * 模型名里能认出"这是个视觉模型"的特征词。
+ *
+ * 只有网关**不返回** `is_vision` 时才用得上：我们公司的网关会给出这个字段，
+ * 但各家云厂商的 `/v1/models` 通常只有一个 `id`（豆包官方、OpenAI 官方都是这样）。
+ * 用户换成自己的模型 Key 时，只能按名字猜。
+ *
+ * 宁可漏认（少列几个，用户还能自由输入），也不要把纯文本模型列进去。
+ */
+const VISION_NAME_HINTS = [
+    /vision/i,
+    /\bvl\b/i,
+    /-vl-/i,
+    /multimodal/i,
+    /omni/i,
+    /多模态/,
+    /glm-?4\.?[56]?v/i,
+    /gpt-4(o|\.1|\.5)?/i,
+    /claude-3|claude-4/i,
+    /gemini/i,
+    /qwen.*vl/i,
+];
+
+/** 看名字能不能认出是视觉模型。 */
+function looksLikeVisionModel(id) {
+    const name = String(id || '');
+    return VISION_NAME_HINTS.some((re) => re.test(name));
+}
+
+/**
  * 列出当前 key 可用的视觉模型。
  *
- * 网关的 `/v1/models` 会给出 178 个模型（含 33 个 qwen 系），但只有
- * `is_vision === 1` 的能读图。用户换模型前先看这个清单，比猜名字靠谱。
+ * 我们有 `is_vision` 字段时以它为准（权威）；外部用户接自己的网关上没有这个字段，
+ * 就按模型名猜 —— 否则他们的 `list_models` 会返回空清单，等于用不了这个功能。
  *
  * @param {{baseUrl: string, apiKey: string, timeout?: number, signal?: AbortSignal}} options
  * @returns {Promise<Array<{id: string, desc: string, owned_by: string}>>}
@@ -362,7 +391,10 @@ async function listVisionModels(options) {
     }
     const rows = json && Array.isArray(json.data) ? json.data : [];
     return rows
-        .filter((row) => row && row.is_vision === 1)
+        .filter((row) => row && (row.is_vision === undefined || row.is_vision === null
+            ? looksLikeVisionModel(row.id)
+            : row.is_vision === 1 || row.is_vision === '1'))
+        .filter((row) => !(row.is_docchain === 1 || row.is_docchain === '1'))
         .map((row) => ({
             id: String(row.id || ''),
             desc: oneLine(row.model_desc || row.display_name || '', 120),

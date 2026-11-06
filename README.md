@@ -334,9 +334,13 @@ Things worth knowing:
 
 ```yaml
 docchain_vision_url: https://lab.iwhalecloud.com/gpt-proxy/v1
-docchain_vision_model: qwen3-vl-plus               # fallback only: used when no chat model resolves
-docchain_vision_candidates: qwen3-vl-plus,doubao-seed-2.0-pro,glm-5v-turbo,g-doubao-seed-2.1-pro,g-gpt-5.6-sol
-                                                  # comma-separated, best first. The first usable one is the
+docchain_vision_model: doubao-seed-2.0-pro         # fallback only: used when no chat model resolves
+docchain_vision_candidates: doubao-seed-2.0-pro,g-doubao-seed-2.1-pro,qwen3-vl-plus,glm-5v-turbo,g-gpt-5.6-sol
+                                                  # comma-separated, best first. Order comes from a measured
+                                                  # benchmark (5 models x 6 real org charts x 2 runs each):
+                                                  # both doubao models were 6/6, qwen3-vl-plus scored 0 on
+                                                  # two-row peer charts, and glm-5v-turbo misclassifies
+                                                  # simple fan-outs as prose. The first usable one is the
                                                   # fallback primary; the judge is the first usable one that
                                                   # differs from the primary (reading with the same model twice
                                                   # gives no second opinion). Shipped in this plugin's own
@@ -350,6 +354,18 @@ docchain_vision_diagram: on                           # structure diagrams as pl
 ```
 
 The CLI uses `VISION_BASE_URL` / `VISION_MODEL` / `VISION_JUDGE_MODEL` / `VISION_FALLBACK_MODEL` / `VISION_API_KEY` / `VISION_MAX_DESC_CHARS` / `VISION_DIAGRAM` instead. Use `list_models` to see which vision models your key can actually reach.
+
+**Bring your own model service**: point `docchain_vision_url` + `docchain_vision_key_ref` at your own OpenAI-compatible gateway (Volcengine Ark, Alibaba Bailian, self-hosted vLLM all work). The model list **adapts to your gateway**:
+
+- If the gateway returns an `is_vision` field, that field is authoritative.
+- If it does not (Davinci/Doubao official, Alibaba, and OpenAI `/v1/models` only return ids), models are recognised by name (`vision`, `vl`, `gpt-4o`, `doubao-2.x`, …).
+- When **none** of the built-in candidate names exist on your gateway, the list follows your gateway's own order instead of offering models you cannot call.
+
+**When no vision model is reachable** (for example a DeepSeek account, which only has text models), the tool does **not** open a picker; it fails fast with:
+
+> 当前没有可使用的视觉模型，请更换 API key 选择可使用的视觉模型。
+
+That avoids making the user pick something that cannot work.
 
 ### deep-research-advanced — multi-subagent deep research
 

@@ -74,8 +74,8 @@ export const DEFAULT_KEY_REF = "DOCCHAIN_API_KEY";
 export const DEFAULT_VISION_KEY_REF = "IWHALE_API_KEY";
 /** Default gateway endpoint for image descriptions (OpenAI-compatible). */
 export const DEFAULT_VISION_URL = "https://lab.iwhalecloud.com/gpt-proxy/v1";
-/** Default vision model: a VL-specific model; measured best on Chinese charts. */
-export const DEFAULT_VISION_MODEL = "qwen3-vl-plus";
+/** Default vision model: the first entry of DEFAULT_VISION_CANDIDATES. */
+export const DEFAULT_VISION_MODEL = "doubao-seed-2.0-pro";
 /**
  * Vision model candidates, ordered by overall capability.
  *
@@ -83,18 +83,28 @@ export const DEFAULT_VISION_MODEL = "qwen3-vl-plus";
  * read images; the judge is the first one that is usable AND differs from the
  * primary (the same model read twice yields no second opinion).
  *
- * The first three are VL-specific models with measured behaviour on real
- * documents — qwen3-vl-plus merges parallel inputs while doubao-seed-2.0-pro
- * flips edge directions, so their intersection drops invented edges. The last
- * two are gold-tier general models, kept for breadth rather than proven chart
- * accuracy. Override with `docchain_vision_candidates`; this list only applies
- * when nothing is configured.
+ * Order comes from a measured benchmark (5 models x 6 real org charts x 2 runs
+ * each, scored on "did the root's direct reports come out right"):
+ *
+ *   doubao-seed-2.0-pro    100    6/6 exact
+ *   g-doubao-seed-2.1-pro  100    6/6 exact
+ *   qwen3-vl-plus         69.9    **0 on two-row peer charts** (6/31 reports),
+ *                                 perfect on every single-row fan-out
+ *   glm-5v-turbo          60.5    accurate when it engages, but misclassifies
+ *                                 simple fan-outs as prose (no sketch at all)
+ *   g-gpt-5.6-sol         untested, placed last by explicit request
+ *
+ * In short: all of the top four handle a single-row fan-out; **only the two
+ * doubao models are reliable on two-row peer org charts**.
+ *
+ * Override with `docchain_vision_candidates`; this list only applies when
+ * nothing is configured.
  */
 export const DEFAULT_VISION_CANDIDATES = [
-  "qwen3-vl-plus",
   "doubao-seed-2.0-pro",
-  "glm-5v-turbo",
   "g-doubao-seed-2.1-pro",
+  "qwen3-vl-plus",
+  "glm-5v-turbo",
   "g-gpt-5.6-sol",
 ];
 /** Fallback when the primary model is not enabled for the account. */

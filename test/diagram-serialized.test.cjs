@@ -212,11 +212,14 @@ test('parseGraph 对正确结构给出 serializedSiblings = null', () => {
   assert.strictEqual(graph.serializedSiblings, null);
 });
 
-test('结构图提示词必须包含"平级兄弟不许串成链"的两条规则', () => {
+test('结构图提示词必须包含"先分组、再连边"的规则', () => {
   const prompt = mod.buildPrompt('某组织架构', 1, 3, 'on');
-  // 规则 10：一排小方框是同时属于上级，不是第一个管第二个
+  // 规则 10：先分组再连边，兄弟之间不许连
+  assert.match(prompt, /先分组，再连边/);
   assert.match(prompt, /不是"第一个管第二个、第二个管第三个"/);
-  assert.match(prompt, /各连一条线过去/);
+  assert.match(prompt, /一组内分组|是兄弟，兄弟之间没有上下级关系|兄弟之间没有上下级关系/);
+  // JSON 模板必须带上 groups 字段
+  assert.match(prompt, /"groups":\[\{"label"/);
   // 规则 11：只有分隔线没有箭头时，方向是"上管下 / 左管右"
   assert.match(prompt, /没有箭头\*\*时/);
   assert.match(prompt, /上面管下面/);
@@ -228,6 +231,25 @@ test('关闭结构图时提示词不含这两条规则（走纯描述路径）',
 });
 
 test('阈值常量有明确的默认值', () => {
-  assert.strictEqual(mod.SERIAL_MIN_FANOUT, 5);
+  // 3 而不是 5：实测一张真实组织图里模型只挂了 4 个产品线到某个办公室，
+  // 5 这个门槛刚好漏过去。2 个节点的前后关系在流程图里太常见，不能报。
+  assert.strictEqual(mod.SERIAL_MIN_FANOUT, 3);
   assert.strictEqual(mod.SERIAL_MIN_CHAIN_EDGES, 3);
+  assert.strictEqual(mod.SERIAL_CHAIN_RATIO, 0.8);
+});
+
+test('候选顺序按实测横评排列：doubao 两个在前，g-gpt-5.6-sol 置底', () => {
+  // 顺序来自一次真实横评（5 模型 × 6 张真实组织架构图 × 每张 2 次，
+  // 判分标准是"根的直接下级数量对不对"）：
+  //   doubao-seed-2.0-pro / g-doubao-seed-2.1-pro   6/6 全对
+  //   qwen3-vl-plus                                两排平级图 0 分（根下级 6/31）
+  //   glm-5v-turbo                                 会把简单扇出整张误判成描述
+  //   g-gpt-5.6-sol                                未测，按要求置底
+  assert.deepStrictEqual(mod.DEFAULT_VISION_CANDIDATES, [
+    'doubao-seed-2.0-pro',
+    'g-doubao-seed-2.1-pro',
+    'qwen3-vl-plus',
+    'glm-5v-turbo',
+    'g-gpt-5.6-sol',
+  ]);
 });

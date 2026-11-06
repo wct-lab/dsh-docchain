@@ -334,9 +334,13 @@ Bundle 插入一个 Host 插件（`dsh-docchain`），激活时在 `ctx.skills` 
 
 ```yaml
 docchain_vision_url: https://lab.iwhalecloud.com/gpt-proxy/v1
-docchain_vision_model: qwen3-vl-plus               # 兜底：取不到对话模型时才用
-docchain_vision_candidates: qwen3-vl-plus,doubao-seed-2.0-pro,glm-5v-turbo,g-doubao-seed-2.1-pro,g-gpt-5.6-sol
-                                                  # 逗号分隔，最好在前。第一个可用项当主模型兜底；
+docchain_vision_model: doubao-seed-2.0-pro         # 兜底：取不到对话模型时才用
+docchain_vision_candidates: doubao-seed-2.0-pro,g-doubao-seed-2.1-pro,qwen3-vl-plus,glm-5v-turbo,g-gpt-5.6-sol
+                                                  # 逗号分隔，最好在前。顺序来自实测横评
+                                                  # （5 模型 × 6 张真实组织架构图 × 每张 2 次）：
+                                                  # doubao 两个全对；qwen 在"两排平级"图上 0 分；
+                                                  # glm 会把简单扇出误判成描述。
+                                                  # 第一个可用项当主模型兜底；
                                                   # 复核模型取其中第一个"可用且与主模型不同"的
                                                   # （同一个模型读两遍拿不到第二视角）。
                                                   # 已写进插件自带的 cordis.patch.yml，装上就有。
@@ -348,6 +352,18 @@ docchain_vision_diagram: on                           # 结构图输出 plantuml
 ```
 
 CLI 用环境变量：`VISION_BASE_URL` / `VISION_MODEL` / `VISION_JUDGE_MODEL` / `VISION_FALLBACK_MODEL` / `VISION_API_KEY` / `VISION_MAX_DESC_CHARS` / `VISION_DIAGRAM`。用 `list_models` 可以先看这把 key 到底能用哪些视觉模型。
+
+**接自己的模型服务**：`docchain_vision_url` + `docchain_vision_key_ref` 改指自己的 OpenAI 兼容网关即可（豆包方舟、通义百炼、自建 vLLM 都行）。模型清单会**自动适应用户的网关**：
+
+- 网关返回 `is_vision` 字段 → 以字段为准；
+- 没有该字段（豆包官方、阿里、OpenAI 的 `/v1/models` 都只有 id）→ 按模型名识别（`vision` / `vl` / `gpt-4o` / `doubao-2.x` 等）；
+- 内置候选名在你的网关上**一个都不存在**时，按你网关自己的顺序列出，而不是列一堆用不了的。
+
+**拿不到任何视觉模型时**（例如当前用的是 DeepSeek 账号，它只有纯文本模型），工具**不会弹窗列模型**，而是直接提示：
+
+> 当前没有可使用的视觉模型，请更换 API key 选择可使用的视觉模型。
+
+这样不会让用户白点一次再撞墙。
 
 ### deep-research-advanced（高级深度研究）
 
