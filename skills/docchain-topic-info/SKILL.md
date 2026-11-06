@@ -28,6 +28,10 @@ description: 查询 docchain 文档主题（topic_id，非 Kafka Topic）列表�
 | size | ❌ | 20 | 每页数量（上限 500） |
 | keyword | ❌ | 无 | 主题名称或 ID 关键字过滤（服务端同时匹配两者） |
 
+> **不要随手把 `size` 调大。** 服务端有近三千个主题，`size=200` 一次要返回两万多字符、
+> 约一万 token；默认 20 条约 400 token。只有确实要先扫一遍全部主题时才加大，
+> 且优先考虑用 `keyword` 缩小范围。
+
 ## 对应工具
 
 **`docchain_topic_info`** —— 由宿主直接执行，**不要手工去跑脚本**。
@@ -46,16 +50,20 @@ description: 查询 docchain 文档主题（topic_id，非 Kafka Topic）列表�
 {
   "ok": true,
   "mode": "topics",
-  "total": 2726,
+  "total": 2843,
   "page": 1,
   "size": 20,
-  "pages": 137,
+  "pages": 143,
   "topics": [
-    { "id": 10904, "name": "test1011", "state": "A",
-      "create_date": "2026-10-11 19:40:34", "create_by_name": "bote_..." }
+    { "id": 11381, "name": "运维知识库-故障处理" },
+    { "id": 10904, "name": "test1011" }
   ]
 }
 ```
+
+> 每条只有 `id` 和 `name`。`state`、`create_date`、`create_by_name` 这三个字段
+> 对"找到 topic_id"这个用途没有帮助，默认一页 200 条时它们占了约六成字符，
+> 所以不再返回。
 
 ### 失败
 

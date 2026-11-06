@@ -71,8 +71,39 @@ test('不读图的操作不查 Key', () => {
   assert.match(BODY, /!isPreview/, 'preview 不该要求视觉 Key');
 });
 
-test('list_models 仍然要求 Key（它必须拉清单）', () => {
-  assert.match(BODY, /if \(args\.list_models\) needsVisionGateway = true/);
+test('list_models 在需要网关时要求 Key，但对话模型能读图时不拦', () => {
+  // 早先写成 `if (args.list_models) needsVisionGateway = true` —— 无条件置真，
+  // 于是"对话模型本身能读图"的人想看一次清单也被"Key 未配置"挡住，
+  // 正是本文件最上面记的那个老毛病在 list_models 上又犯了一遍。
+  //
+  // 现在的口径：list_models 要拉清单确实得有 Key，但**只有**在对话模型
+  // 不能读图（isVis !== true）时才需要。
+  assert.match(
+    BODY,
+    /if \(wantsModelList && isVis !== true\) needsVisionGateway = true/,
+    'list_models 应仅在对话模型不能读图时要求 Key',
+  );
+  assert.ok(
+    !/if \(args\.list_models\) needsVisionGateway = true/.test(BODY),
+    '旧的无条件写法必须删除',
+  );
+  // 能力校验必须覆盖 list_models，否则 isVis 恒为 null，"能读图"永远判不出来
+  assert.match(
+    BODY,
+    /if \(\(needsVision \|\| wantsModelList\) && resolvedModel\)/,
+    'list_models 也要做能力校验',
+  );
+});
+
+test('能力校验只做一次（不重复拉 /models）', () => {
+  // 早先 needsVision 分支和 Key 分支各调一次 isModelVision，一次调用拉两遍清单。
+  const calls = BODY.match(/await isModelVision\(/g) || [];
+  // 自由输入的模型还要单独校验一次，所以允许 2 处，但主判定不能重复
+  assert.ok(calls.length <= 2, `isModelVision 调用过多：${calls.length}`);
+  assert.ok(
+    !/let isVis = null;[\s\S]*?let isVis = null;/.test(BODY),
+    'isVis 不应重复声明',
+  );
 });
 
 test('确实要借视觉模型但没 Key 时，报错要指明配哪儿', () => {

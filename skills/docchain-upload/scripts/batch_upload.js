@@ -1,458 +1,151 @@
 #!/usr/bin/env node
 /**
- * Docchain批量文档上传工具
- * 支持单文件上传、文件夹批量上传。
+ * Docchain 批量上传 —— 命令行入口。
  *
- * dsh-docchain integration: the service URL and API key resolve through the
- * package's shared config chain (env vars > skill scripts/config.json >
- * plugin state file ~/.dsh/storages/docchain-config.json > package
- * skills/docchain_config.json), see getConfig.
+ * 业务实现已经搬进 `lib/tools/docchain.js`（`runUpload`），本文件只是薄壳：
+ * 解析 `--flag`、解析配置、调业务函数、把结果打到 stdout。
+ *
+ * 原来 459 行里有 159 行是 CLI 脚手架，业务本身很简单（扫目录 → 逐个上传 → 汇总）。
+ *
+ * ⚠️ 这是写操作，会真正写入知识库。
+ *
+ * 用法：
+ *   node batch_upload.js --path ./docs/a.pdf --topic_id 11249
+ *   node batch_upload.js --path ./docs --topic_id 11249 --mode folder
+ *
+ * 配置取值顺序（沿用原有约定）：
+ *   环境变量 DOCCHAIN_URL / DOCCHAIN_API_KEY
+ *   > skills/docchain-upload/scripts/config.json
+ *   > ~/.dsh/storages/docchain-config.json
+ *   > 包内 skills/docchain_config.json
  */
 'use strict';
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const http = require('http');
-const https = require('https');
-const { URL } = require('url');
+const { pathToFileURL } = require('url');
 
-const CONFIG_MESSAGE = `请正确配置以下参数
+/** lib/tools/docchain.js 是 ESM，必须用动态 import 加载。 */
+const LIB_PATH = path.join(__dirname, '..', '..', '..', 'lib', 'tools', 'docchain.js');
+
+const CONFIG_HINT = `请正确配置以下参数
 docchain_url: 环境指向地址（必填）
 docchain_api_key: 环境的账号验证方式（必填）
 方式1: 环境变量 DOCCHAIN_URL, DOCCHAIN_API_KEY
 方式2: 插件配置：dsh-docchain 插件的 Config（激活时自动写入
-       ~/.dsh/storages/docchain-config.json，也可直接手动编辑该文件）：
+       ~/.dsh/storages/docchain-config.json，也可直接手动编辑该文件）
        {"docchain_url": "http://<host>:7100/llmdoc", "docchain_api_key": "your-api-key"}
-方式3: 配置文件 docchain-upload/scripts/config.json， 如下格式：
-\`\`\`json
-{
-  "docchain_url": "http://<host>:7100/llmdoc",
-  "docchain_api_key": "your-api-key",
-}
-\`\`\`
-方式4: 包内 skills/docchain_config.json，同上json格式（分发兜底，参考 docchain_config.example.json）
+方式3: 配置文件 skills/docchain-upload/scripts/config.json
+方式4: 包内 skills/docchain_config.json（分发兜底）
 **注：配置取值顺序优先级为 环境变量 > scripts/config.json > ~/.dsh/storages/docchain-config.json > 包内 docchain_config.json**`;
 
-const USAGE = `用法：
-  node batch_upload.js upload-file <file_path> --topic_id <id>      上传单个文件
-  node batch_upload.js upload-folder <folder_path> --topic_id <id>  批量上传文件夹
+const ARG_SPEC = {
+    path: { type: 'string', required: true },
+    topic_id: { type: 'int', required: true },
+    mode: { type: 'string', default: 'file', choices: ['file', 'folder'] },
+};
 
-示例：
-  node batch_upload.js upload-file document.pdf --topic_id 123
-  node batch_upload.js upload-folder ./docs --topic_id 123`;
-
-/**
- * Read and parse a JSON config file. A missing file stays silent; an
- * unreadable/invalid file warns on stderr and is skipped.
- * @param {string} configPath
- * @returns {object|null}
- */
-function readJsonFile(configPath) {
-    if (!fs.existsSync(configPath)) {
-        return null;
+/** 解析 `--flag value` / `--flag=value`。 */
+function parseArgs(argv, argSpec) {
+    const args = {};
+    for (const [name, spec] of Object.entries(argSpec)) {
+        args[name] = spec.default !== undefined ? spec.default : null;
     }
+    for (let i = 0; i < argv.length; i += 1) {
+        const arg = argv[i];
+        if (!arg.startsWith('--')) continue;
+        let name = arg.slice(2);
+        let value;
+        const eq = name.indexOf('=');
+        if (eq >= 0) {
+            value = name.slice(eq + 1);
+            name = name.slice(0, eq);
+        }
+        const spec = argSpec[name];
+        if (!spec) {
+            console.error(`❌ 错误：未知参数：${arg}`);
+            process.exit(1);
+        }
+        if (value === undefined) {
+            value = argv[i + 1];
+            i += 1;
+            if (value === undefined) {
+                console.error(`❌ 错误：参数 ${arg} 缺少值`);
+                process.exit(1);
+            }
+        }
+        if (spec.type === 'int') {
+            if (!/^\d+$/.test(value)) {
+                console.error(`❌ 错误：参数 ${arg} 必须是数字`);
+                process.exit(1);
+            }
+            value = parseInt(value, 10);
+        }
+        args[name] = value;
+    }
+    for (const [name, spec] of Object.entries(argSpec)) {
+        if (spec.required && (args[name] === null || args[name] === undefined)) {
+            console.error(`❌ 错误：缺少必填参数 --${name}`);
+            process.exit(1);
+        }
+        if (spec.choices && args[name] !== null && !spec.choices.includes(args[name])) {
+            console.error(`❌ 错误：参数 --${name} 取值必须是 ${spec.choices.join('/')}`);
+            process.exit(1);
+        }
+    }
+    return args;
+}
+
+function readJsonFile(configPath) {
+    if (!fs.existsSync(configPath)) return null;
     try {
         const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
         return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-    } catch (error) {
+    } catch {
         console.error(`警告：配置文件不是合法 JSON，已忽略：${configPath}`);
         return null;
     }
 }
 
-/**
- * Load the docchain service config through the shared priority chain:
- * env vars > skill scripts/config.json > plugin state file > package
- * skills/docchain_config.json. URL and API key are both required here;
- * an incomplete config prints a JSON error on stdout and exits.
- * @returns {{docchain_url: string, docchain_api_key: string}}
- */
+/** 四级配置优先级。命令行专属 —— 走工具时配置由宿主传入。 */
 function getConfig() {
-    const currentConfigPath = path.join(__dirname, 'config.json');
-    const packageConfigPath = path.join(__dirname, '..', '..', 'docchain_config.json');
-    const stateConfigPath = path.join(os.homedir(), '.dsh', 'storages', 'docchain-config.json');
-
     const config = {
-        ...readJsonFile(packageConfigPath), // 包内兜底（可随包分发占位）
-        ...readJsonFile(stateConfigPath),   // 插件状态文件（插件 Config 激活时写入，可手动编辑）
-        ...readJsonFile(currentConfigPath), // 技能级覆盖
+        ...readJsonFile(path.join(__dirname, '..', '..', 'docchain_config.json')),
+        ...readJsonFile(path.join(os.homedir(), '.dsh', 'storages', 'docchain-config.json')),
+        ...readJsonFile(path.join(__dirname, 'config.json')),
     };
-
-    const envUrl = process.env.DOCCHAIN_URL;
-    const envKey = process.env.DOCCHAIN_API_KEY;
-    if (envUrl) {
-        config.docchain_url = envUrl;
-    }
-    if (envKey) {
-        config.docchain_api_key = envKey;
-    }
-
+    if (process.env.DOCCHAIN_URL) config.docchain_url = process.env.DOCCHAIN_URL;
+    if (process.env.DOCCHAIN_API_KEY) config.docchain_api_key = process.env.DOCCHAIN_API_KEY;
     if (!config.docchain_url || !config.docchain_api_key) {
-        printError('CONFIG', CONFIG_MESSAGE);
+        console.log(JSON.stringify({ ok: false, error: 'CONFIG', message: CONFIG_HINT }));
+        process.exit(1);
     }
     return config;
 }
 
-/**
- * Print a structured failure envelope `{ok:false, error, message}` on stdout
- * and exit. `NO_RESULTS` is treated as a normal empty result (exit 0); any
- * other code exits 1.
- * @param {string} error - CONFIG|NO_RESULTS|NOT_FOUND|NO_PERMISSION|SERVER_ERROR
- * @param {string} message
- */
-function printError(error, message) {
-    console.log(JSON.stringify({ ok: false, error, message }));
-    process.exit(error === 'NO_RESULTS' ? 0 : 1);
-}
-
-/**
- * POST a single-file multipart/form-data body and parse the JSON response.
- * @param {string} url
- * @param {object} headers
- * @param {object} file - { filename, content }
- * @returns {Promise<{status: number, data: any, text: string}>}
- */
-function uploadMultipart(url, headers, { filename, content }) {
-    return new Promise((resolve, reject) => {
-        const urlObj = new URL(url);
-        const isHttps = urlObj.protocol === 'https:';
-        const httpModule = isHttps ? https : http;
-        const boundary = '----DocchainBoundary' + Math.random().toString(36).substring(2);
-
-        const body = Buffer.concat([
-            Buffer.from(
-                `--${boundary}\r\n` +
-                `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
-                'Content-Type: application/octet-stream\r\n\r\n',
-                'utf8'
-            ),
-            content,
-            Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
-        ]);
-
-        const reqOptions = {
-            hostname: urlObj.hostname,
-            port: urlObj.port || (isHttps ? 443 : 80),
-            path: urlObj.pathname + urlObj.search,
-            method: 'POST',
-            headers: {
-                ...headers,
-                'Content-Type': `multipart/form-data; boundary=${boundary}`,
-                'Content-Length': body.length,
-            },
-            timeout: 120000,
-        };
-
-        const req = httpModule.request(reqOptions, (res) => {
-            const chunks = [];
-            res.on('data', (chunk) => chunks.push(chunk));
-            res.on('end', () => {
-                const text = Buffer.concat(chunks).toString('utf8');
-                let data;
-                try {
-                    data = JSON.parse(text);
-                } catch (error) {
-                    data = null;
-                }
-                resolve({ status: res.statusCode, data, text });
-            });
-        });
-
-        req.on('error', (error) => reject(error));
-        req.on('timeout', () => {
-            req.destroy();
-            reject(new Error('请求超时'));
-        });
-
-        req.write(body);
-        req.end();
-    });
-}
-
-/**
- * A business failure carrying the same error vocabulary as the tool layer.
- * Pure functions throw this instead of printing and exiting, so the same code
- * serves both the CLI and the in-process tool registration.
- */
-class DocchainError extends Error {
-    constructor(code, message) {
-        super(message);
-        this.name = 'DocchainError';
-        this.code = code;
-    }
-}
-
-class DocchainUploader {
-    /**
-     * @param {object|null} config - 传入时直接使用（工具层）；省略则按配置链读取（CLI）
-     * @param {boolean} quiet - true 时不上报进度（工具层）
-     */
-    constructor(config = null, quiet = false) {
-        this.config = config || getConfig();
-        this.quiet = quiet;
-    }
-
-    /** 进度输出：工具层静默，CLI 照常。 */
-    log(line = '') {
-        if (!this.quiet) console.log(line);
-    }
-
-    /**
-     * 调用Docchain API
-     * @param {string} endpoint
-     * @param {string} filePath
-     * @param {number} topicId
-     * @returns {Promise<object>} 解析后的 API 响应
-     */
-    async _callApi(endpoint, filePath, topicId) {
-        const url = `${this.config.docchain_url.replace(/\/+$/, '')}/v1/skills/${endpoint}`;
-        const params = new URLSearchParams({ topic_id: String(topicId) });
-        const fullUrl = `${url}?${params.toString()}`;
-
-        const headers = { 'X-Api-Key': this.config.docchain_api_key };
-
-        try {
-            const filename = path.basename(filePath);
-            const content = fs.readFileSync(filePath);
-            const response = await uploadMultipart(fullUrl, headers, { filename, content });
-
-            if (response.status >= 400) {
-                if (response.status === 401 || response.status === 403) {
-                    throw new DocchainError('NO_PERMISSION', `无权限上传到该主题（HTTP ${response.status}）`);
-                }
-                throw new DocchainError('SERVER_ERROR', `API请求失败: HTTP ${response.status} ${response.text}`);
-            }
-            const data = response.data;
-            if (data && data.success === false) {
-                throw new DocchainError('SERVER_ERROR', `API请求失败: ${data.err || '未知错误'}`);
-            }
-            return data;
-        } catch (error) {
-            if (error instanceof DocchainError) throw error;
-            throw new DocchainError('SERVER_ERROR', `API请求失败: ${error.message}`);
-        }
-    }
-
-    /**
-     * 上传单个文件
-     * @param {string} filePath
-     * @param {number} topicId
-     * @returns {Promise<object>}
-     */
-    async uploadFile(filePath, topicId) {
-        if (!fs.existsSync(filePath)) {
-            return { success: false, error: `文件不存在: ${filePath}` };
-        }
-
-        if (!topicId) {
-            return { success: false, error: '未提供 topic_id，必须通过 --topic_id 参数指定' };
-        }
-
-        try {
-            const result = await this._callApi('upload_doc', filePath, topicId);
-
-            if (result && typeof result === 'object' && !Array.isArray(result) && 'error' in result) {
-                return { success: false, error: result.error, file: filePath };
-            }
-
-            return {
-                success: true,
-                file: filePath,
-                doc_id: result.doc_id,
-                doc_name: result.doc_name,
-                topic_id: result.topic_id,
-            };
-        } catch (error) {
-            return { success: false, error: error.message, file: filePath };
-        }
-    }
-
-    /**
-     * 扫描文件夹中的文件（仅顶层，不递归）
-     * @param {string} folderPath
-     * @returns {string[]}
-     */
-    scanFiles(folderPath) {
-        const files = [];
-
-        if (!fs.existsSync(folderPath)) {
-            throw new DocchainError('NOT_FOUND', `路径不存在: ${folderPath}`);
-        }
-
-        if (fs.statSync(folderPath).isFile()) {
-            files.push(folderPath);
-            return files;
-        }
-
-        if (fs.statSync(folderPath).isDirectory()) {
-            for (const entry of fs.readdirSync(folderPath)) {
-                const fullPath = path.join(folderPath, entry);
-                if (fs.statSync(fullPath).isFile()) {
-                    files.push(fullPath);
-                }
-            }
-        }
-
-        return files.sort();
-    }
-
-    /**
-     * 批量上传文件
-     * @param {string[]} files
-     * @param {number} topicId
-     * @returns {Promise<object>}
-     */
-    async batchUpload(files, topicId) {
-        const total = files.length;
-        let successCount = 0;
-        let failedCount = 0;
-        const results = [];
-
-        this.log(`\n开始批量上传，共 ${total} 个文件\n`);
-
-        for (let idx = 0; idx < files.length; idx += 1) {
-            const filePath = files[idx];
-            const filename = path.basename(filePath);
-            this.log(`\n[${idx + 1}/${total}] 正在上传: ${filename}`);
-
-            const result = await this.uploadFile(filePath, topicId);
-            results.push(result);
-
-            if (result.success) {
-                successCount += 1;
-                this.log(`✓ 上传成功 (doc_id: ${result.doc_id})`);
-            } else {
-                failedCount += 1;
-                this.log(`✗ 上传失败: ${result.error}`);
-            }
-
-            // 显示进度
-            const progress = ((idx + 1) / total) * 100;
-            this.log(`进度: ${progress.toFixed(1)}% | 成功: ${successCount} | 失败: ${failedCount}`);
-        }
-
-        this.log('\n上传完成！');
-        this.log(`总计: ${total} 个文件`);
-        this.log(`成功: ${successCount} 个文件`);
-        this.log(`失败: ${failedCount} 个文件`);
-
-        return {
-            total,
-            success: successCount,
-            failed: failedCount,
-            results,
-        };
-    }
-}
-
-/**
- * 上传单个文件或整个文件夹（仅顶层）。
- * CLI 与宿主工具共用这一条路径。
- * @param {object} config - { docchain_url, docchain_api_key }
- * @param {object} params - { target, topicId, mode: 'file'|'folder', quiet }
- * @returns {Promise<object>} 结构化 payload
- */
-async function runUpload(config, { target, topicId, mode = 'file', quiet = true } = {}) {
-    if (!topicId || !Number.isInteger(topicId) || topicId <= 0) {
-        throw new DocchainError('CONFIG', 'topic_id 必填，且必须是正整数');
-    }
-    if (!target) throw new DocchainError('CONFIG', 'target 必填：要上传的文件或文件夹路径');
-
-    const uploader = new DocchainUploader(config, quiet);
-
-    if (mode === 'folder') {
-        const files = uploader.scanFiles(target);
-        if (files.length === 0) {
-            throw new DocchainError('NO_RESULTS', `文件夹内没有可上传的文件：${target}`);
-        }
-        const summary = await uploader.batchUpload(files, topicId);
-        return Object.assign({ ok: summary.failed === 0, mode: 'batch' }, summary);
-    }
-
-    const result = await uploader.uploadFile(target, topicId);
-    if (!result.success) {
-        // A missing local file is NOT_FOUND, not a server failure: the caller
-        // must be able to tell "wrong path" apart from "the service rejected it".
-        const missing = /不存在/.test(result.error || '');
-        throw new DocchainError(missing ? 'NOT_FOUND' : 'SERVER_ERROR', `上传失败：${result.error}`);
-    }
-    return { ok: true, mode: 'single', doc_id: result.doc_id, doc_name: result.doc_name, topic_id: result.topic_id, file: result.file };
-}
-
 async function main() {
-    const args = process.argv.slice(2);
-    const command = args[0];
-    const targetPath = args[1];
-
-    if (!command || !targetPath) {
-        console.log(USAGE);
+    const args = parseArgs(process.argv.slice(2), ARG_SPEC);
+    const config = getConfig();
+    const lib = await import(pathToFileURL(LIB_PATH).href);
+    try {
+        // 命令行模式下把每个文件的进度打到 stderr，不污染 stdout 的 JSON。
+        const payload = await lib.runUpload(config, {
+            target: args.path,
+            topicId: args.topic_id,
+            mode: args.mode,
+        });
+        for (const r of payload.results) {
+            const mark = r.success ? '✓' : '✗';
+            console.error(`${mark} ${r.file}${r.success ? ` (doc_id: ${r.doc_id})` : ` — ${r.error}`}`);
+        }
+        console.error(`\n总计 ${payload.total}，成功 ${payload.success}，失败 ${payload.failed}`);
+        console.log(JSON.stringify(payload));
+    } catch (error) {
+        const code = (error && error.code) || 'SERVER_ERROR';
+        console.log(JSON.stringify({ ok: false, error: code, message: error.message }));
         process.exit(1);
     }
-
-    // 解析 --topic_id（支持 --topic_id <id> 与 --topic_id=<id>）
-    let topicId = null;
-    for (let i = 2; i < args.length; i += 1) {
-        let value;
-        if (args[i].startsWith('--topic_id=')) {
-            value = args[i].slice('--topic_id='.length);
-        } else if (args[i] === '--topic_id') {
-            value = args[i + 1];
-            i += 1;
-        }
-        if (value !== undefined) {
-            if (!/^\d+$/.test(value)) {
-                printError('CONFIG', '错误：topic_id 必须是数字');
-            }
-            topicId = parseInt(value, 10);
-        }
-    }
-    if (topicId === null) {
-        printError('CONFIG', '错误：缺少必填参数 --topic_id');
-    }
-
-    // 初始化上传器
-    const uploader = new DocchainUploader();
-
-    // 执行命令
-    try {
-        if (command === 'upload-file') {
-            const result = await uploader.uploadFile(targetPath, topicId);
-            console.log(JSON.stringify(Object.assign({ ok: result.success === true }, result)));
-        } else if (command === 'upload-folder') {
-            const files = uploader.scanFiles(targetPath);
-
-            if (files.length === 0) {
-                printError('NO_RESULTS', '未找到匹配的文件');
-            }
-
-            console.log(`\n找到 ${files.length} 个文件:`);
-            for (const f of files.slice(0, 10)) {
-                console.log(`  - ${path.basename(f)}`);
-            }
-            if (files.length > 10) {
-                console.log(`  ... 还有 ${files.length - 10} 个文件`);
-            }
-
-            const summary = await uploader.batchUpload(files, topicId);
-            console.log(JSON.stringify(Object.assign({ ok: summary.failed === 0, mode: 'batch' }, summary)));
-        } else {
-            console.log(USAGE);
-            process.exit(1);
-        }
-    } catch (error) {
-        printError(error.code || 'SERVER_ERROR', error.message);
-    }
 }
 
-if (require.main === module) {
-    main();
-}
-
-// The host half calls these directly (in-process tool execution).
-module.exports = {
-    DocchainUploader,
-    runUpload,
-    getConfig,
-    DocchainError,
-};
+main();

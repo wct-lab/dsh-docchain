@@ -206,10 +206,31 @@ function loadBaseUrl() {
 }
 
 class Doc2Markdown {
-    constructor() {
+    /**
+     * @param {{silent?: boolean}} [options] - silent=true 时不打进度日志。
+     *
+     * 为什么要 silent：这个类会被 `lib/tools/docchain.js` **在进程内**调用
+     * （DSH 的工具不是子进程）。类里的 `this.log` 会直接混进宿主的 stdout，
+     * 而工具的返回值是结构化 JSON —— 模型看到的是两样东西拼在一起。
+     * 命令行入口保持原样（silent=false），进度照旧打到终端。
+     */
+    constructor(options = {}) {
         this.BASE_URL = loadBaseUrl();
         // Optional API key; null means anonymous upload
         this.apiKey = loadApiKey();
+        this.silent = Boolean(options && options.silent);
+        /** 最近一次可诊断的失败原因；供调用方拼进最终报错。 */
+        this.lastError = '';
+    }
+
+    /**
+     * 进度日志：命令行打 stdout（保持原有输出），进程内调用时丢弃。
+     * 名字容易误解 —— 它**不是**错误通道，只是"给人看的进度"。
+     * @param {string} line
+     */
+    log(line) {
+        if (this.silent) return;
+        console.log(line);
     }
 
     /**
@@ -335,7 +356,10 @@ class Doc2Markdown {
      */
     async uploadFile(filePath) {
         if (!fs.existsSync(filePath)) {
-            console.log(`错误：文件不存在 - ${filePath}`);
+            this.log(`错误：文件不存在 - ${filePath}`);
+            // 记住具体原因：调用方只会看到 "文件上传失败"，早先真相只打在日志里，
+            // 进程内调用时那条日志被吞掉，模型就只剩一句无法排查的话。
+            this.lastError = `文件不存在 - ${filePath}`;
             return null;
         }
 
@@ -368,24 +392,24 @@ class Doc2Markdown {
             if (response.status === 200) {
                 const responseJson = response.data;
                 if (!responseJson.success && responseJson.success !== undefined) {
-                    console.log(`API 请求失败：${responseJson.err}`);
+                    this.log(`API 请求失败：${responseJson.err}`);
                     return null;
                 }
                 const docId = responseJson.doc_id;
                 if (docId) {
                     return docId;
                 } else {
-                    console.log(`上传成功但未获取到文档引用 ID`);
+                    this.log(`上传成功但未获取到文档引用 ID`);
                     return null;
                 }
             } else {
-                console.log(`上传失败，状态码：${response.status}`);
-                console.log(`错误信息：${JSON.stringify(response.data)}`);
+                this.log(`上传失败，状态码：${response.status}`);
+                this.log(`错误信息：${JSON.stringify(response.data)}`);
                 return null;
             }
 
         } catch (error) {
-            console.log(`上传文件时发生错误：${error.message}`);
+            this.log(`上传文件时发生错误：${error.message}`);
             return null;
         }
     }
@@ -408,7 +432,7 @@ class Doc2Markdown {
             if (response.status === 200) {
                 const data = response.data;
                 if (!data.success && data.success !== undefined) {
-                    console.log(`状态查询失败：${data.err}`);
+                    this.log(`状态查询失败：${data.err}`);
                     return null;
                 }
                 const statusDetail = data.status_detail || {};
@@ -420,12 +444,12 @@ class Doc2Markdown {
                 }
                 return { status: 'converting', error: '' };
             } else {
-                console.log(`状态查询失败，状态码：${response.status}，错误信息：${JSON.stringify(response.data)}`);
+                this.log(`状态查询失败，状态码：${response.status}，错误信息：${JSON.stringify(response.data)}`);
                 return null;
             }
 
         } catch (error) {
-            console.log(`查询状态时发生错误：${error.message}`);
+            this.log(`查询状态时发生错误：${error.message}`);
             return null;
         }
     }
@@ -449,12 +473,12 @@ class Doc2Markdown {
             if (response.status === 200) {
                 return response.data;
             } else {
-                console.log(`获取内容失败，状态码：${response.status}`);
+                this.log(`获取内容失败，状态码：${response.status}`);
                 return null;
             }
 
         } catch (error) {
-            console.log(`获取内容时发生错误：${error.message}`);
+            this.log(`获取内容时发生错误：${error.message}`);
             return null;
         }
     }
@@ -478,12 +502,12 @@ class Doc2Markdown {
             if (response.status === 200) {
                 return response.data;
             } else {
-                console.log(`获取内容失败，状态码：${response.status}`);
+                this.log(`获取内容失败，状态码：${response.status}`);
                 return null;
             }
 
         } catch (error) {
-            console.log(`获取内容时发生错误：${error.message}`);
+            this.log(`获取内容时发生错误：${error.message}`);
             return null;
         }
     }
@@ -505,7 +529,7 @@ class Doc2Markdown {
             return outPath;
 
         } catch (error) {
-            console.log(`保存文件时发生错误：${error.message}`);
+            this.log(`保存文件时发生错误：${error.message}`);
             return null;
         }
     }
@@ -522,11 +546,11 @@ class Doc2Markdown {
         while (elapsed < POLL_TIMEOUT) {
             const result = await this.checkStatus(docId);
             if (result === null) {
-                console.log("错误：无法获取文档状态，请稍后重试");
+                this.log("错误：无法获取文档状态，请稍后重试");
                 throw new DocchainError('SERVER_ERROR', '无法获取文档状态，请稍后重试');
             }
             if (result.status === 'done') {
-                console.log(`  转换完成，正在下载...`);
+                this.log(`  转换完成，正在下载...`);
                 if (mdOnly) {
                     const markdownBytes = await this.getMarkdownFile(docId);
                     if (!markdownBytes) {
@@ -554,7 +578,7 @@ class Doc2Markdown {
                 const reason = result.error ? `：${result.error}` : '';
                 return [false, `文档转换失败${reason}`];
             } else {
-                console.log(`  转换中... 已等待 ${elapsed}s。`);
+                this.log(`  转换中... 已等待 ${elapsed}s。`);
                 await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL * 1000));
                 elapsed += POLL_INTERVAL;
             }
@@ -570,32 +594,34 @@ class Doc2Markdown {
      */
     async convertFile(filePath, mdOnly = false) {
         // 1. Upload file
-        console.log(`[1/3] 正在上传文件：${filePath}`);
+        this.lastError = '';
+        this.log(`[1/3] 正在上传文件：${filePath}`);
         const docId = await this.uploadFile(filePath);
         if (!docId) {
-            console.log(`文件上传失败！`);
-            throw new DocchainError('SERVER_ERROR', `文件上传失败：${filePath}`);
+            this.log(`文件上传失败！`);
+            const reason = this.lastError ? `（${this.lastError}）` : '';
+            throw new DocchainError('SERVER_ERROR', `文件上传失败${reason}：${filePath}`);
         }
-        console.log(`  上传成功，文档 ID：${docId}`);
+        this.log(`  上传成功，文档 ID：${docId}`);
 
         // 2. Poll and wait (up to 60 seconds)
-        console.log(`[2/3] 等待转换完成（自动轮询）...`);
+        this.log(`[2/3] 等待转换完成（自动轮询）...`);
         const [result, detail] = await this.pollUntilDone(docId, filePath, mdOnly);
 
         if (result === true) {
-            console.log(`[3/3] 下载完成，文件已保存：${detail}`);
+            this.log(`[3/3] 下载完成，文件已保存：${detail}`);
             return { ok: true, mode: 'convert', doc_id: docId, saved_path: detail };
         } else if (result === false) {
-            console.log(`错误：${detail}`);
+            this.log(`错误：${detail}`);
             throw new DocchainError('SERVER_ERROR', `转换失败：${detail}`);
         } else {
-            console.log(`  文档 ID：${docId}`);
-            console.log(`[!] 文档仍在转换中（已超过 ${POLL_TIMEOUT}s）`);
+            this.log(`  文档 ID：${docId}`);
+            this.log(`[!] 文档仍在转换中（已超过 ${POLL_TIMEOUT}s）`);
             if (mdOnly) {
-                console.log(`[!] 转换完成后，可执行：node scripts/doc2markdown.js check ${docId} "${filePath}" --md`);
+                this.log(`[!] 转换完成后，可执行：node scripts/doc2markdown.js check ${docId} "${filePath}" --md`);
             } else {
-                console.log(`[!] 大文档通常需要更长时间；高峰时段转换可能排队，请耐心等待`);
-                console.log(`[!] 是否继续查询转换状态并下载`);
+                this.log(`[!] 大文档通常需要更长时间；高峰时段转换可能排队，请耐心等待`);
+                this.log(`[!] 是否继续查询转换状态并下载`);
             }
             // 仍在转换中不是失败：如实返回 pending，让调用方用 check 继续。
             return {
@@ -696,7 +722,7 @@ class Doc2Markdown {
             return outDir;
 
         } catch (error) {
-            console.log(`保存文件时发生错误：${error.message}`);
+            this.log(`保存文件时发生错误：${error.message}`);
             return null;
         }
     }
@@ -708,56 +734,56 @@ class Doc2Markdown {
      * @param {boolean} mdOnly - if true, download as single MD file instead of ZIP
      */
     async checkAndDownload(docId, filePath, mdOnly = false) {
-        console.log(`[1/2] 正在查询文档 ${docId} 的转换状态...`);
+        this.log(`[1/2] 正在查询文档 ${docId} 的转换状态...`);
         const result = await this.checkStatus(docId);
         if (result === null) {
-            console.log("Error: Unable to get document status, please retry later");
+            this.log("Error: Unable to get document status, please retry later");
             throw new DocchainError('SERVER_ERROR', '无法获取文档状态，请稍后重试');
         }
 
         if (result.status === 'failed') {
             const reason = result.error ? `：${result.error}` : '';
-            console.log(`错误：文档转换失败${reason}`);
+            this.log(`错误：文档转换失败${reason}`);
             throw new DocchainError('SERVER_ERROR', `文档转换失败${reason}`);
         } else if (result.status === 'done') {
-            console.log(`  转换已完成，正在下载...`);
+            this.log(`  转换已完成，正在下载...`);
             if (mdOnly) {
                 const markdownBytes = await this.getMarkdownFile(docId);
                 if (!markdownBytes) {
-                    console.log("获取 Markdown 内容失败");
+                    this.log("获取 Markdown 内容失败");
                     throw new DocchainError('SERVER_ERROR', '获取 Markdown 内容失败');
                 }
                 const outFilePath = await this.saveMarkdownFile(markdownBytes, filePath);
                 if (!outFilePath) {
                     throw new DocchainError('SERVER_ERROR', '保存 Markdown 文件失败');
                 }
-                console.log(`[2/2] 下载完成，文件已保存：${outFilePath}`);
+                this.log(`[2/2] 下载完成，文件已保存：${outFilePath}`);
                 return { ok: true, mode: 'check', doc_id: docId, saved_path: outFilePath };
             } else {
                 const zipBytes = await this.getMarkdown(docId);
                 if (!zipBytes) {
-                    console.log("获取 Markdown 内容失败");
+                    this.log("获取 Markdown 内容失败");
                     throw new DocchainError('SERVER_ERROR', '获取 Markdown 内容失败');
                 }
                 const outDir = await this.saveMarkdown(zipBytes, docId, filePath);
                 if (!outDir) {
                     throw new DocchainError('SERVER_ERROR', '保存 Markdown 包失败');
                 }
-                console.log(`[2/2] 下载完成，文件已保存：${outDir}`);
+                this.log(`[2/2] 下载完成，文件已保存：${outDir}`);
                 return { ok: true, mode: 'check', doc_id: docId, saved_path: outDir };
             }
         } else {
-            console.log("  文档仍在转换中，继续等待...");
+            this.log("  文档仍在转换中，继续等待...");
             const [result, detail] = await this.pollUntilDone(docId, filePath, mdOnly);
             if (result === true) {
-                console.log(`[2/2] 下载完成，文件已保存：${detail}`);
+                this.log(`[2/2] 下载完成，文件已保存：${detail}`);
                 return { ok: true, mode: 'check', doc_id: docId, saved_path: detail };
             } else if (result === false) {
-                console.log(`错误：${detail}`);
+                this.log(`错误：${detail}`);
                 throw new DocchainError('SERVER_ERROR', `转换失败：${detail}`);
             } else {
-                console.log(`[!] 文档仍在转换中，请稍后重试`);
-                console.log(`  文档 ID：${docId}`);
+                this.log(`[!] 文档仍在转换中，请稍后重试`);
+                this.log(`  文档 ID：${docId}`);
                 return {
                     ok: false,
                     error: 'PENDING',
@@ -812,11 +838,17 @@ function failJson(error, message) {
 /**
  * CLI / 工具共用的入口：convert（上传+轮询+下载）或 check（按 doc_id 查状态并下载）。
  * 本类自行解析服务地址与 API Key（与其他脚本的配置链不同），因此不需要外部 config。
- * @param {object} params - { action: 'convert'|'check', file_path, doc_id, md_only }
+ *
+ * 默认 silent=true：这个函数会被 `lib/tools/docchain.js` 在进程内直接调用，
+ * 进度行打到 stdout 会污染工具返回的结构化 JSON。命令行入口在那层自己
+ * 用 silent=false 新建实例，进度照旧打到终端。
+ *
+ * @param {object} params - { action: 'convert'|'check', file_path, doc_id, md_only, silent }
  * @returns {Promise<object>} 结构化 payload
  */
 async function runDoc2Markdown(params = {}) {
-    const converter = new Doc2Markdown();
+    // 显式传 silent:false 才打进度；默认安静（进程内工具路径）。
+    const converter = new Doc2Markdown({ silent: params.silent !== false });
     const mdOnly = Boolean(params.md_only);
     const action = params.action === 'check' ? 'check' : 'convert';
 
@@ -857,7 +889,7 @@ async function main() {
             console.log("用法：node doc2markdown.js convert <file_path> [--md]");
             failJson('CONFIG', 'convert 需要 <file_path> 参数');
         }
-        emitCliResult(await runDoc2Markdown({ action: 'convert', file_path: process.argv[3], md_only: mdOnly }));
+        emitCliResult(await runDoc2Markdown({ action: 'convert', file_path: process.argv[3], md_only: mdOnly, silent: false }));
 
     } else if (cmd === "check") {
         if (process.argv.length < 5 || process.argv.length > 6) {
@@ -869,12 +901,13 @@ async function main() {
             doc_id: process.argv[3],
             file_path: process.argv[4],
             md_only: mdOnly,
+            silent: false,
         }));
 
     } else {
         // Backward compatibility: treat direct file path as convert
         if (fs.existsSync(cmd) && fs.statSync(cmd).isFile()) {
-            emitCliResult(await runDoc2Markdown({ action: 'convert', file_path: cmd, md_only: mdOnly }));
+            emitCliResult(await runDoc2Markdown({ action: 'convert', file_path: cmd, md_only: mdOnly, silent: false }));
         } else {
             console.log(`未知命令：${cmd}`);
             console.log(USAGE);

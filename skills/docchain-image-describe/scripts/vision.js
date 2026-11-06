@@ -393,8 +393,10 @@ async function listVisionModels(options) {
     return rows
         .filter((row) => row && (row.is_vision === undefined || row.is_vision === null
             ? looksLikeVisionModel(row.id)
-            : row.is_vision === 1 || row.is_vision === '1'))
-        .filter((row) => !(row.is_docchain === 1 || row.is_docchain === '1'))
+            : row.is_vision === 1 || row.is_vision === '1' || row.is_vision === true))
+        // DocChain 知识库应用也被网关一并标成 is_vision=1，但它们不是能读图的大模型。
+        // true 也要认：JSON 布尔和数字 1 在不同网关上都会出现，只比 1 会漏掉布尔那种。
+        .filter((row) => !(row.is_docchain === 1 || row.is_docchain === '1' || row.is_docchain === true))
         .map((row) => ({
             id: String(row.id || ''),
             desc: oneLine(row.model_desc || row.display_name || '', 120),
